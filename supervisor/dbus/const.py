@@ -25,12 +25,14 @@ DBUS_IFACE_HAOS = "io.hass.os"
 DBUS_IFACE_HAOS_APPARMOR = "io.hass.os.AppArmor"
 DBUS_IFACE_HAOS_BOARDS = "io.hass.os.Boards"
 DBUS_IFACE_HAOS_CGROUP = "io.hass.os.CGroup"
+DBUS_IFACE_HAOS_CONFIG_SWAP = "io.hass.os.Config.Swap"
 DBUS_IFACE_HAOS_DATADISK = "io.hass.os.DataDisk"
 DBUS_IFACE_HAOS_SYSTEM = "io.hass.os.System"
 DBUS_IFACE_HOSTNAME = "org.freedesktop.hostname1"
 DBUS_IFACE_IP4CONFIG = "org.freedesktop.NetworkManager.IP4Config"
 DBUS_IFACE_IP6CONFIG = "org.freedesktop.NetworkManager.IP6Config"
 DBUS_IFACE_NM = "org.freedesktop.NetworkManager"
+DBUS_IFACE_NVME_CONTROLLER = "org.freedesktop.UDisks2.NVMe.Controller"
 DBUS_IFACE_PARTITION = "org.freedesktop.UDisks2.Partition"
 DBUS_IFACE_PARTITION_TABLE = "org.freedesktop.UDisks2.PartitionTable"
 DBUS_IFACE_RAUC_INSTALLER = "de.pengutronix.rauc.Installer"
@@ -53,6 +55,7 @@ DBUS_OBJECT_HAOS = "/io/hass/os"
 DBUS_OBJECT_HAOS_APPARMOR = "/io/hass/os/AppArmor"
 DBUS_OBJECT_HAOS_BOARDS = "/io/hass/os/Boards"
 DBUS_OBJECT_HAOS_CGROUP = "/io/hass/os/CGroup"
+DBUS_OBJECT_HAOS_CONFIG_SWAP = "/io/hass/os/Config/Swap"
 DBUS_OBJECT_HAOS_DATADISK = "/io/hass/os/DataDisk"
 DBUS_OBJECT_HAOS_SYSTEM = "/io/hass/os/System"
 DBUS_OBJECT_HOSTNAME = "/org/freedesktop/hostname1"
@@ -85,6 +88,7 @@ DBUS_ATTR_CONNECTIVITY = "Connectivity"
 DBUS_ATTR_CURRENT_DEVICE = "CurrentDevice"
 DBUS_ATTR_CURRENT_DNS_SERVER = "CurrentDNSServer"
 DBUS_ATTR_CURRENT_DNS_SERVER_EX = "CurrentDNSServerEx"
+DBUS_ATTR_CONTROLLER_ID = "ControllerID"
 DBUS_ATTR_DEFAULT = "Default"
 DBUS_ATTR_DEPLOYMENT = "Deployment"
 DBUS_ATTR_DESCRIPTION = "Description"
@@ -109,6 +113,7 @@ DBUS_ATTR_DRIVER = "Driver"
 DBUS_ATTR_EJECTABLE = "Ejectable"
 DBUS_ATTR_FALLBACK_DNS = "FallbackDNS"
 DBUS_ATTR_FALLBACK_DNS_EX = "FallbackDNSEx"
+DBUS_ATTR_FGUID = "FGUID"
 DBUS_ATTR_FINISH_TIMESTAMP = "FinishTimestamp"
 DBUS_ATTR_FIRMWARE_TIMESTAMP_MONOTONIC = "FirmwareTimestampMonotonic"
 DBUS_ATTR_FREQUENCY = "Frequency"
@@ -133,6 +138,7 @@ DBUS_ATTR_LAST_ERROR = "LastError"
 DBUS_ATTR_LLMNR = "LLMNR"
 DBUS_ATTR_LLMNR_HOSTNAME = "LLMNRHostname"
 DBUS_ATTR_LOADER_TIMESTAMP_MONOTONIC = "LoaderTimestampMonotonic"
+DBUS_ATTR_LOCAL_RTC = "LocalRTC"
 DBUS_ATTR_MANAGED = "Managed"
 DBUS_ATTR_MODE = "Mode"
 DBUS_ATTR_MODEL = "Model"
@@ -144,6 +150,7 @@ DBUS_ATTR_NAMESERVERS = "Nameservers"
 DBUS_ATTR_NTP = "NTP"
 DBUS_ATTR_NTPSYNCHRONIZED = "NTPSynchronized"
 DBUS_ATTR_NUMBER = "Number"
+DBUS_ATTR_NVME_REVISION = "NVMeRevision"
 DBUS_ATTR_OFFSET = "Offset"
 DBUS_ATTR_OPERATING_SYSTEM_PRETTY_NAME = "OperatingSystemPrettyName"
 DBUS_ATTR_OPERATION = "Operation"
@@ -158,23 +165,35 @@ DBUS_ATTR_REMOVABLE = "Removable"
 DBUS_ATTR_RESOLV_CONF_MODE = "ResolvConfMode"
 DBUS_ATTR_REVISION = "Revision"
 DBUS_ATTR_RCMANAGER = "RcManager"
+DBUS_ATTR_SANITIZE_PERCENT_REMAINING = "SanitizePercentRemaining"
+DBUS_ATTR_SANITIZE_STATUS = "SanitizeStatus"
 DBUS_ATTR_SEAT = "Seat"
 DBUS_ATTR_SERIAL = "Serial"
 DBUS_ATTR_SIZE = "Size"
+DBUS_ATTR_SMART_CRITICAL_WARNING = "SmartCriticalWarning"
+DBUS_ATTR_SMART_POWER_ON_HOURS = "SmartPowerOnHours"
+DBUS_ATTR_SMART_SELFTEST_PERCENT_REMAINING = "SmartSelftestPercentRemaining"
+DBUS_ATTR_SMART_SELFTEST_STATUS = "SmartSelftestStatus"
+DBUS_ATTR_SMART_TEMPERATURE = "SmartTemperature"
+DBUS_ATTR_SMART_UPDATED = "SmartUpdated"
 DBUS_ATTR_SSID = "Ssid"
 DBUS_ATTR_STATE = "State"
 DBUS_ATTR_STATE_FLAGS = "StateFlags"
 DBUS_ATTR_STATIC_HOSTNAME = "StaticHostname"
 DBUS_ATTR_STATIC_OPERATING_SYSTEM_CPE_NAME = "OperatingSystemCPEName"
 DBUS_ATTR_STRENGTH = "Strength"
+DBUS_ATTR_SUBSYSTEM_NQN = "SubsystemNQN"
 DBUS_ATTR_SUPPORTED_FILESYSTEMS = "SupportedFilesystems"
 DBUS_ATTR_SYMLINKS = "Symlinks"
+DBUS_ATTR_SWAP_SIZE = "SwapSize"
+DBUS_ATTR_SWAPPINESS = "Swappiness"
 DBUS_ATTR_TABLE = "Table"
 DBUS_ATTR_TIME_DETECTED = "TimeDetected"
 DBUS_ATTR_TIMEUSEC = "TimeUSec"
 DBUS_ATTR_TIMEZONE = "Timezone"
 DBUS_ATTR_TRANSACTION_STATISTICS = "TransactionStatistics"
 DBUS_ATTR_TYPE = "Type"
+DBUS_ATTR_UNALLOCATED_CAPACITY = "UnallocatedCapacity"
 DBUS_ATTR_USER_LED = "UserLED"
 DBUS_ATTR_USERSPACE_TIMESTAMP_MONOTONIC = "UserspaceTimestampMonotonic"
 DBUS_ATTR_UUID_UPPERCASE = "UUID"
@@ -206,6 +225,24 @@ class InterfaceMethod(StrEnum):
     LINK_LOCAL = "link-local"
 
 
+class InterfaceAddrGenMode(IntEnum):
+    """Interface addr_gen_mode."""
+
+    EUI64 = 0
+    STABLE_PRIVACY = 1
+    DEFAULT_OR_EUI64 = 2
+    DEFAULT = 3
+
+
+class InterfaceIp6Privacy(IntEnum):
+    """Interface ip6_privacy."""
+
+    DEFAULT = -1
+    DISABLED = 0
+    ENABLED_PREFER_PUBLIC = 1
+    ENABLED = 2
+
+
 class ConnectionType(StrEnum):
     """Connection type."""
 
@@ -213,10 +250,10 @@ class ConnectionType(StrEnum):
     WIRELESS = "802-11-wireless"
 
 
-class ConnectionStateType(IntEnum):
+class ConnectionState(IntEnum):
     """Connection states.
 
-    https://developer.gnome.org/NetworkManager/stable/nm-dbus-types.html#NMActiveConnectionState
+    https://networkmanager.dev/docs/api/latest/nm-dbus-types.html#NMActiveConnectionState
     """
 
     UNKNOWN = 0
@@ -229,7 +266,7 @@ class ConnectionStateType(IntEnum):
 class ConnectionStateFlags(IntEnum):
     """Connection state flags.
 
-    https://developer-old.gnome.org/NetworkManager/stable/nm-dbus-types.html#NMActivationStateFlags
+    https://networkmanager.dev/docs/api/latest/nm-dbus-types.html#NMActivationStateFlags
     """
 
     NONE = 0
@@ -246,7 +283,7 @@ class ConnectionStateFlags(IntEnum):
 class ConnectivityState(IntEnum):
     """Network connectvity.
 
-    https://developer.gnome.org/NetworkManager/unstable/nm-dbus-types.html#NMConnectivityState
+    https://networkmanager.dev/docs/api/latest/nm-dbus-types.html#NMConnectivityState
     """
 
     CONNECTIVITY_UNKNOWN = 0
@@ -259,7 +296,7 @@ class ConnectivityState(IntEnum):
 class DeviceType(IntEnum):
     """Device types.
 
-    https://developer.gnome.org/NetworkManager/stable/nm-dbus-types.html#NMDeviceType
+    https://networkmanager.dev/docs/api/latest/nm-dbus-types.html#NMDeviceType
     """
 
     UNKNOWN = 0
@@ -269,6 +306,8 @@ class DeviceType(IntEnum):
     VLAN = 11
     TUN = 16
     VETH = 20
+    WIREGUARD = 29
+    LOOPBACK = 32
 
 
 class WirelessMethodType(IntEnum):
@@ -294,6 +333,15 @@ class MulticastProtocolEnabled(StrEnum):
     YES = "yes"
     NO = "no"
     RESOLVE = "resolve"
+
+
+class MulticastDnsValue(IntEnum):
+    """Connection MulticastDNS (mdns/llmnr) values."""
+
+    DEFAULT = -1
+    OFF = 0
+    RESOLVE = 1
+    ANNOUNCE = 2
 
 
 class DNSOverTLSEnabled(StrEnum):

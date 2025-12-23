@@ -1,19 +1,21 @@
 """Init file for Supervisor auth/SSO RESTful API."""
 
 import asyncio
+from collections.abc import Awaitable
 import logging
-from typing import Any
+from typing import Any, cast
 
 from aiohttp import BasicAuth, web
 from aiohttp.hdrs import AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE
+from aiohttp.web import FileField
 from aiohttp.web_exceptions import HTTPUnauthorized
+from multidict import MultiDictProxy
 import voluptuous as vol
 
 from ..addons.addon import Addon
 from ..const import ATTR_NAME, ATTR_PASSWORD, ATTR_USERNAME, REQUEST_FROM
 from ..coresys import CoreSysAttributes
-from ..exceptions import APIForbidden
-from ..utils.json import json_loads
+from ..exceptions import APIForbidden, AuthInvalidNonStringValueError
 from .const import (
     ATTR_GROUP_IDS,
     ATTR_IS_ACTIVE,
@@ -23,7 +25,7 @@ from .const import (
     CONTENT_TYPE_JSON,
     CONTENT_TYPE_URL,
 )
-from .utils import api_process, api_validate
+from .utils import api_process, api_validate, json_loads
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ REALM_HEADER: dict[str, str] = {
 class APIAuth(CoreSysAttributes):
     """Handle RESTful API for auth functions."""
 
-    def _process_basic(self, request: web.Request, addon: Addon) -> bool:
+    def _process_basic(self, request: web.Request, addon: Addon) -> Awaitable[bool]:
         """Process login request with basic auth.
 
         Return a coroutine.
@@ -51,8 +53,11 @@ class APIAuth(CoreSysAttributes):
         return self.sys_auth.check_login(addon, auth.login, auth.password)
 
     def _process_dict(
-        self, request: web.Request, addon: Addon, data: dict[str, str]
-    ) -> bool:
+        self,
+        request: web.Request,
+        addon: Addon,
+        data: dict[str, Any] | MultiDictProxy[str | bytes | FileField],
+    ) -> Awaitable[bool]:
         """Process login with dict data.
 
         Return a coroutine.
@@ -60,14 +65,24 @@ class APIAuth(CoreSysAttributes):
         username = data.get("username") or data.get("user")
         password = data.get("password")
 
-        return self.sys_auth.check_login(addon, username, password)
+        # Test that we did receive strings and not something else, raise if so
+        try:
+            _ = username.encode and password.encode  # type: ignore
+        except AttributeError:
+            raise AuthInvalidNonStringValueError(
+                _LOGGER.error, headers=REALM_HEADER
+            ) from None
+
+        return self.sys_auth.check_login(
+            addon, cast(str, username), cast(str, password)
+        )
 
     @api_process
     async def auth(self, request: web.Request) -> bool:
         """Process login request."""
         addon = request[REQUEST_FROM]
 
-        if not addon.access_auth_api:
+        if not isinstance(addon, Addon) or not addon.access_auth_api:
             raise APIForbidden("Can't use Home Assistant auth!")
 
         # BasicAuth
@@ -79,13 +94,18 @@ class APIAuth(CoreSysAttributes):
         # Json
         if request.headers.get(CONTENT_TYPE) == CONTENT_TYPE_JSON:
             data = await request.json(loads=json_loads)
-            return await self._process_dict(request, addon, data)
+            if not await self._process_dict(request, addon, data):
+                raise HTTPUnauthorized()
+            return True
 
         # URL encoded
         if request.headers.get(CONTENT_TYPE) == CONTENT_TYPE_URL:
             data = await request.post()
-            return await self._process_dict(request, addon, data)
+            if not await self._process_dict(request, addon, data):
+                raise HTTPUnauthorized()
+            return True
 
+        # Advertise Basic authentication by default
         raise HTTPUnauthorized(headers=REALM_HEADER)
 
     @api_process
@@ -99,7 +119,7 @@ class APIAuth(CoreSysAttributes):
     @api_process
     async def cache(self, request: web.Request) -> None:
         """Process cache reset request."""
-        self.sys_auth.reset_data()
+        await self.sys_auth.reset_data()
 
     @api_process
     async def list_users(self, request: web.Request) -> dict[str, list[dict[str, Any]]]:

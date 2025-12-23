@@ -5,6 +5,8 @@ import logging
 from docker.errors import DockerException
 from requests import RequestException
 
+from supervisor.docker.const import ADDON_BUILDER_IMAGE
+
 from ...const import CoreState
 from ...coresys import CoreSys
 from ..const import (
@@ -38,7 +40,7 @@ class EvaluateContainer(EvaluateBase):
         """Initialize the evaluation class."""
         super().__init__(coresys)
         self.coresys = coresys
-        self._images = set()
+        self._images: set[str] = set()
 
     @property
     def reason(self) -> UnsupportedReason:
@@ -60,9 +62,10 @@ class EvaluateContainer(EvaluateBase):
         """Return a set of all known images."""
         return {
             self.sys_homeassistant.image,
-            self.sys_supervisor.image,
-            *(plugin.image for plugin in self.sys_plugins.all_plugins),
-            *(addon.image for addon in self.sys_addons.installed),
+            self.sys_supervisor.image or self.sys_supervisor.default_image,
+            *(plugin.image for plugin in self.sys_plugins.all_plugins if plugin.image),
+            *(addon.image for addon in self.sys_addons.installed if addon.image),
+            ADDON_BUILDER_IMAGE,
         }
 
     async def evaluate(self) -> bool:
@@ -71,7 +74,9 @@ class EvaluateContainer(EvaluateBase):
         self._images.clear()
 
         try:
-            containers = await self.sys_run_in_executor(self.sys_docker.containers.list)
+            containers = await self.sys_run_in_executor(
+                self.sys_docker.containers_legacy.list
+            )
         except (DockerException, RequestException) as err:
             _LOGGER.error("Corrupt docker overlayfs detect: %s", err)
             self.sys_resolution.create_issue(
@@ -101,6 +106,6 @@ class EvaluateContainer(EvaluateBase):
                         "Found image in unhealthy image list '%s' on the host",
                         image_name,
                     )
-                    self.sys_resolution.unhealthy = UnhealthyReason.DOCKER
+                    self.sys_resolution.add_unhealthy_reason(UnhealthyReason.DOCKER)
 
         return len(self._images) != 0

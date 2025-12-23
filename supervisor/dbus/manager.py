@@ -8,7 +8,7 @@ from dbus_fast.aio.message_bus import MessageBus
 
 from ..const import SOCKET_DBUS
 from ..coresys import CoreSys, CoreSysAttributes
-from ..exceptions import DBusFatalError
+from ..exceptions import DBusFatalError, DBusNotConnectedError
 from .agent import OSAgent
 from .hostname import Hostname
 from .interface import DBusInterface
@@ -92,6 +92,13 @@ class DBusManager(CoreSysAttributes):
         return self._bus
 
     @property
+    def connected_bus(self) -> MessageBus:
+        """Return the message bus. Raise if not connected."""
+        if not self._bus:
+            raise DBusNotConnectedError()
+        return self._bus
+
+    @property
     def all(self) -> list[DBusInterface]:
         """Return all managed dbus interfaces."""
         return [
@@ -108,14 +115,16 @@ class DBusManager(CoreSysAttributes):
 
     async def load(self) -> None:
         """Connect interfaces to D-Bus."""
-        if not SOCKET_DBUS.exists():
+        if not await self.sys_run_in_executor(SOCKET_DBUS.exists):
             _LOGGER.error(
                 "No D-Bus support on Host. Disabled any kind of host control!"
             )
             return
 
         try:
-            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            self._bus = connected_bus = await MessageBus(
+                bus_type=BusType.SYSTEM
+            ).connect()
         except Exception as err:
             raise DBusFatalError(
                 "Cannot connect to system D-Bus. Disabled any kind of host control!"
@@ -124,17 +133,17 @@ class DBusManager(CoreSysAttributes):
         _LOGGER.info("Connected to system D-Bus.")
 
         errors = await asyncio.gather(
-            *[dbus.connect(self.bus) for dbus in self.all], return_exceptions=True
+            *[dbus.connect(connected_bus) for dbus in self.all], return_exceptions=True
         )
 
-        for err in errors:
-            if err:
-                dbus = self.all[errors.index(err)]
+        for error in errors:
+            if error:
+                dbus = self.all[errors.index(error)]
                 _LOGGER.warning(
                     "Can't load dbus interface %s %s: %s",
                     dbus.name,
                     dbus.object_path,
-                    err,
+                    error,
                 )
 
         self.sys_host.supported_features.cache_clear()

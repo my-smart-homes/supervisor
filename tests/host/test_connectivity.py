@@ -4,9 +4,11 @@
 import asyncio
 from unittest.mock import PropertyMock, patch
 
+from dbus_fast import Variant
 import pytest
 
 from supervisor.coresys import CoreSys
+from supervisor.plugins.dns import PluginDns
 
 from tests.dbus_service_mocks.network_manager import (
     NetworkManager as NetworkManagerService,
@@ -84,3 +86,49 @@ async def test_connectivity_events(coresys: CoreSys, force: bool):
                     },
                 }
             )
+
+
+async def test_dns_configuration_change_triggers_notify_locals_changed(
+    coresys: CoreSys, dns_manager_service
+):
+    """Test that DNS configuration changes trigger notify_locals_changed."""
+    await coresys.host.network.load()
+
+    with patch.object(PluginDns, "notify_locals_changed") as notify_locals_changed:
+        # Test that non-Configuration changes don't trigger notify_locals_changed
+        dns_manager_service.emit_properties_changed({"Mode": "default"})
+        await dns_manager_service.ping()
+        notify_locals_changed.assert_not_called()
+
+        # Test that Configuration changes trigger notify_locals_changed
+        configuration = [
+            {
+                "nameservers": Variant("as", ["192.168.2.2"]),
+                "domains": Variant("as", ["lan"]),
+                "interface": Variant("s", "eth0"),
+                "priority": Variant("i", 100),
+                "vpn": Variant("b", False),
+            }
+        ]
+
+        dns_manager_service.emit_properties_changed({"Configuration": configuration})
+        await dns_manager_service.ping()
+        notify_locals_changed.assert_called_once()
+
+        notify_locals_changed.reset_mock()
+        # Test that subsequent Configuration changes also trigger notify_locals_changed
+        different_configuration = [
+            {
+                "nameservers": Variant("as", ["8.8.8.8"]),
+                "domains": Variant("as", ["example.com"]),
+                "interface": Variant("s", "wlan0"),
+                "priority": Variant("i", 200),
+                "vpn": Variant("b", True),
+            }
+        ]
+
+        dns_manager_service.emit_properties_changed(
+            {"Configuration": different_configuration}
+        )
+        await dns_manager_service.ping()
+        notify_locals_changed.assert_called_once()

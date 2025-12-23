@@ -1,27 +1,27 @@
 """Bootstrap Supervisor."""
 
 # ruff: noqa: T100
+import asyncio
+from collections.abc import Callable
+from importlib import import_module
 import logging
 import os
-from pathlib import Path
 import signal
+import warnings
 
 from colorlog import ColoredFormatter
 
 from .addons.manager import AddonManager
 from .api import RestAPI
-from .arch import CpuArch
+from .arch import CpuArchManager
 from .auth import Auth
 from .backups.manager import BackupManager
 from .bus import Bus
 from .const import (
-    ATTR_ADDONS_CUSTOM_LIST,
-    ATTR_REPOSITORIES,
     ENV_HOMEASSISTANT_REPOSITORY,
     ENV_SUPERVISOR_MACHINE,
     ENV_SUPERVISOR_NAME,
     ENV_SUPERVISOR_SHARE,
-    MACHINE_ID,
     SOCKET_DOCKER,
     LogLevel,
     UpdateChannel,
@@ -45,45 +45,56 @@ from .resolution.module import ResolutionManager
 from .security.module import Security
 from .services import ServiceManager
 from .store import StoreManager
-from .store.validate import ensure_builtin_repositories
 from .supervisor import Supervisor
 from .updater import Updater
-from .utils.sentry import init_sentry
+from .utils.sentry import capture_exception, init_sentry
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 async def initialize_coresys() -> CoreSys:
     """Initialize supervisor coresys/objects."""
-    coresys = CoreSys()
+    coresys = await CoreSys().load_config()
+
+    # Check if ENV is in development mode
+    if coresys.dev:
+        _LOGGER.warning("Environment variable 'SUPERVISOR_DEV' is set")
+        coresys.config.logging = LogLevel.DEBUG
+        coresys.config.debug = True
+    else:
+        coresys.config.modify_log_level()
 
     # Initialize core objects
-    coresys.docker = DockerAPI(coresys)
-    coresys.resolution = ResolutionManager(coresys)
-    coresys.jobs = JobManager(coresys)
-    coresys.core = Core(coresys)
-    coresys.plugins = PluginManager(coresys)
-    coresys.arch = CpuArch(coresys)
-    coresys.auth = Auth(coresys)
-    coresys.updater = Updater(coresys)
+    coresys.docker = await DockerAPI(coresys).post_init()
+    coresys.resolution = await ResolutionManager(coresys).load_config()
+    await coresys.resolution.load_modules()
+    coresys.jobs = await JobManager(coresys).load_config()
+    coresys.core = await Core(coresys).post_init()
+    coresys.plugins = await PluginManager(coresys).load_config()
+    coresys.arch = CpuArchManager(coresys)
+    coresys.auth = await Auth(coresys).load_config()
+    coresys.updater = await Updater(coresys).load_config()
     coresys.api = RestAPI(coresys)
     coresys.supervisor = Supervisor(coresys)
-    coresys.homeassistant = HomeAssistant(coresys)
-    coresys.addons = AddonManager(coresys)
-    coresys.backups = BackupManager(coresys)
-    coresys.host = HostManager(coresys)
-    coresys.hardware = HardwareManager(coresys)
-    coresys.ingress = Ingress(coresys)
+    coresys.homeassistant = await HomeAssistant(coresys).load_config()
+    coresys.addons = await AddonManager(coresys).load_config()
+    coresys.backups = await BackupManager(coresys).load_config()
+    coresys.host = await HostManager(coresys).post_init()
+    coresys.hardware = await HardwareManager.create(coresys)
+    coresys.ingress = await Ingress(coresys).load_config()
     coresys.tasks = Tasks(coresys)
-    coresys.services = ServiceManager(coresys)
-    coresys.store = StoreManager(coresys)
-    coresys.discovery = Discovery(coresys)
+    coresys.services = await ServiceManager(coresys).load_config()
+    coresys.store = await StoreManager(coresys).load_config()
+    coresys.discovery = await Discovery(coresys).load_config()
     coresys.dbus = DBusManager(coresys)
     coresys.os = OSManager(coresys)
     coresys.scheduler = Scheduler(coresys)
-    coresys.security = Security(coresys)
+    coresys.security = await Security(coresys).load_config()
     coresys.bus = Bus(coresys)
-    coresys.mounts = MountManager(coresys)
+    coresys.mounts = await MountManager(coresys).load_config()
+
+    # Set Machine/Host ID
+    await coresys.init_machine()
 
     # diagnostics
     if coresys.config.diagnostics:
@@ -92,32 +103,11 @@ async def initialize_coresys() -> CoreSys:
     # bootstrap config
     initialize_system(coresys)
 
-    # Set Machine/Host ID
-    if MACHINE_ID.exists():
-        coresys.machine_id = MACHINE_ID.read_text(encoding="utf-8").strip()
-
-    # Check if ENV is in development mode
     if coresys.dev:
-        _LOGGER.warning("Environment variable 'SUPERVISOR_DEV' is set")
-        coresys.config.logging = LogLevel.DEBUG
-        coresys.config.debug = True
         coresys.updater.channel = UpdateChannel.DEV
-        coresys.security.content_trust = False
-    else:
-        coresys.config.modify_log_level()
 
     # Convert datetime
     logging.Formatter.converter = lambda *args: coresys.now().timetuple()
-
-    # Set machine type
-    if os.environ.get(ENV_SUPERVISOR_MACHINE):
-        coresys.machine = os.environ[ENV_SUPERVISOR_MACHINE]
-    elif os.environ.get(ENV_HOMEASSISTANT_REPOSITORY):
-        coresys.machine = os.environ[ENV_HOMEASSISTANT_REPOSITORY][14:-14]
-        _LOGGER.warning(
-            "Missing SUPERVISOR_MACHINE environment variable. Fallback to deprecated extraction!"
-        )
-    _LOGGER.info("Setting up coresys for machine: %s", coresys.machine)
 
     return coresys
 
@@ -169,6 +159,11 @@ def initialize_system(coresys: CoreSys) -> None:
     if not config.path_backup.is_dir():
         _LOGGER.debug("Creating Supervisor backup folder at '%s'", config.path_backup)
         config.path_backup.mkdir()
+
+    # Core backup folder
+    if not config.path_core_backup.is_dir():
+        _LOGGER.debug("Creating Core backup folder at '%s", config.path_core_backup)
+        config.path_core_backup.mkdir(parents=True)
 
     # Share folder
     if not config.path_share.is_dir():
@@ -231,28 +226,16 @@ def initialize_system(coresys: CoreSys) -> None:
         )
         config.path_addon_configs.mkdir()
 
+    if not config.path_cid_files.is_dir():
+        _LOGGER.debug("Creating Docker cidfiles folder at '%s'", config.path_cid_files)
+        config.path_cid_files.mkdir()
 
-def migrate_system_env(coresys: CoreSys) -> None:
-    """Cleanup some stuff after update."""
-    config = coresys.config
 
-    # hass.io 0.37 -> 0.38
-    old_build = Path(config.path_supervisor, "addons/build")
-    if old_build.is_dir():
-        try:
-            old_build.rmdir()
-        except OSError:
-            _LOGGER.error("Can't cleanup old Add-on build directory at '%s'", old_build)
-
-    # Supervisor 2022.5 -> 2022.6. Can be removed after 2022.9
-    # pylint: disable=protected-access
-    if len(coresys.config.addons_repositories) > 0:
-        coresys.store._data[ATTR_REPOSITORIES] = ensure_builtin_repositories(
-            coresys.config.addons_repositories
-        )
-        coresys.config._data[ATTR_ADDONS_CUSTOM_LIST] = []
-        coresys.store.save_data()
-        coresys.config.save_data()
+def warning_handler(message, category, filename, lineno, file=None, line=None):
+    """Warning handler which logs warnings using the logging module."""
+    _LOGGER.warning("%s:%s: %s: %s", filename, lineno, category.__name__, message)
+    if isinstance(message, Exception):
+        capture_exception(message)
 
 
 def initialize_logging() -> None:
@@ -281,6 +264,7 @@ def initialize_logging() -> None:
             },
         )
     )
+    warnings.showwarning = warning_handler
 
 
 def check_environment() -> None:
@@ -305,36 +289,32 @@ def check_environment() -> None:
         _LOGGER.critical("Can't find Docker socket!")
 
 
-def reg_signal(loop, coresys: CoreSys) -> None:
-    """Register SIGTERM and SIGKILL to stop system."""
+def register_signal_handlers(
+    loop: asyncio.AbstractEventLoop, shutdown_handler: Callable[[], None]
+) -> None:
+    """Register SIGTERM, SIGHUP and SIGKILL to stop the Supervisor."""
     try:
-        loop.add_signal_handler(
-            signal.SIGTERM, lambda: loop.create_task(coresys.core.stop())
-        )
+        loop.add_signal_handler(signal.SIGTERM, shutdown_handler)
     except (ValueError, RuntimeError):
         _LOGGER.warning("Could not bind to SIGTERM")
 
     try:
-        loop.add_signal_handler(
-            signal.SIGHUP, lambda: loop.create_task(coresys.core.stop())
-        )
+        loop.add_signal_handler(signal.SIGHUP, shutdown_handler)
     except (ValueError, RuntimeError):
         _LOGGER.warning("Could not bind to SIGHUP")
 
     try:
-        loop.add_signal_handler(
-            signal.SIGINT, lambda: loop.create_task(coresys.core.stop())
-        )
+        loop.add_signal_handler(signal.SIGINT, shutdown_handler)
     except (ValueError, RuntimeError):
         _LOGGER.warning("Could not bind to SIGINT")
 
 
-def supervisor_debugger(coresys: CoreSys) -> None:
+async def supervisor_debugger(coresys: CoreSys) -> None:
     """Start debugger if needed."""
     if not coresys.config.debug:
         return
-    # pylint: disable=import-outside-toplevel
-    import debugpy
+
+    debugpy = await coresys.run_in_executor(import_module, "debugpy")
 
     _LOGGER.info("Initializing Supervisor debugger")
 

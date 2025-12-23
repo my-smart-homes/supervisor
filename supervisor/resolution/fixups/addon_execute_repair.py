@@ -25,7 +25,10 @@ class FixupAddonExecuteRepair(FixupBase):
 
     async def process_fixup(self, reference: str | None = None) -> None:
         """Pull the addons image."""
-        addon = self.sys_addons.get(reference, local_only=True)
+        if not reference:
+            return
+
+        addon = self.sys_addons.get_local_only(reference)
         if not addon:
             _LOGGER.info(
                 "Cannot repair addon %s as it is not installed, dismissing suggestion",
@@ -39,7 +42,7 @@ class FixupAddonExecuteRepair(FixupBase):
             )
             return
 
-        _LOGGER.info("Installing image for addon %s")
+        _LOGGER.info("Installing image for addon %s", reference)
         self.attempts += 1
         await addon.instance.install(addon.version)
 

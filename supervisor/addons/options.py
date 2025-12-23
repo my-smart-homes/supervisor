@@ -75,7 +75,7 @@ class AddonOptions(CoreSysAttributes):
         """Create a schema for add-on options."""
         return vol.Schema(vol.All(dict, self))
 
-    def __call__(self, struct):
+    def __call__(self, struct: dict[str, Any]) -> dict[str, Any]:
         """Create schema validator for add-ons options."""
         options = {}
 
@@ -93,15 +93,7 @@ class AddonOptions(CoreSysAttributes):
 
             typ = self.raw_schema[key]
             try:
-                if isinstance(typ, list):
-                    # nested value list
-                    options[key] = self._nested_validate_list(typ[0], value, key)
-                elif isinstance(typ, dict):
-                    # nested value dict
-                    options[key] = self._nested_validate_dict(typ, value, key)
-                else:
-                    # normal value
-                    options[key] = self._single_validate(typ, value, key)
+                options[key] = self._validate_element(typ, value, key)
             except (IndexError, KeyError):
                 raise vol.Invalid(
                     f"Type error for option '{key}' in {self._name} ({self._slug})"
@@ -111,7 +103,20 @@ class AddonOptions(CoreSysAttributes):
         return options
 
     # pylint: disable=no-value-for-parameter
-    def _single_validate(self, typ: str, value: Any, key: str):
+    def _validate_element(self, typ: Any, value: Any, key: str) -> Any:
+        """Validate a value against a type specification."""
+        if isinstance(typ, list):
+            # nested value list
+            return self._nested_validate_list(typ[0], value, key)
+        elif isinstance(typ, dict):
+            # nested value dict
+            return self._nested_validate_dict(typ, value, key)
+        else:
+            # normal value
+            return self._single_validate(typ, value, key)
+
+    # pylint: disable=no-value-for-parameter
+    def _single_validate(self, typ: str, value: Any, key: str) -> Any:
         """Validate a single element."""
         # if required argument
         if value is None:
@@ -137,7 +142,7 @@ class AddonOptions(CoreSysAttributes):
             ) from None
 
         # prepare range
-        range_args = {}
+        range_args: dict[str, Any] = {}
         for group_name in _SCHEMA_LENGTH_PARTS:
             group_value = match.group(group_name)
             if group_value:
@@ -182,13 +187,13 @@ class AddonOptions(CoreSysAttributes):
 
             # Device valid
             self.devices.add(device)
-            return str(device.path)
+            return str(value)
 
         raise vol.Invalid(
             f"Fatal error for option '{key}' with type '{typ}' in {self._name} ({self._slug})"
         ) from None
 
-    def _nested_validate_list(self, typ: Any, data_list: list[Any], key: str):
+    def _nested_validate_list(self, typ: Any, data_list: Any, key: str) -> list[Any]:
         """Validate nested items."""
         options = []
 
@@ -201,17 +206,13 @@ class AddonOptions(CoreSysAttributes):
         # Process list
         for element in data_list:
             # Nested?
-            if isinstance(typ, dict):
-                c_options = self._nested_validate_dict(typ, element, key)
-                options.append(c_options)
-            else:
-                options.append(self._single_validate(typ, element, key))
+            options.append(self._validate_element(typ, element, key))
 
         return options
 
     def _nested_validate_dict(
-        self, typ: dict[Any, Any], data_dict: dict[Any, Any], key: str
-    ):
+        self, typ: dict[Any, Any], data_dict: Any, key: str
+    ) -> dict[Any, Any]:
         """Validate nested items."""
         options = {}
 
@@ -231,12 +232,7 @@ class AddonOptions(CoreSysAttributes):
                 continue
 
             # Nested?
-            if isinstance(typ[c_key], list):
-                options[c_key] = self._nested_validate_list(
-                    typ[c_key][0], c_value, c_key
-                )
-            else:
-                options[c_key] = self._single_validate(typ[c_key], c_value, c_key)
+            options[c_key] = self._validate_element(typ[c_key], c_value, c_key)
 
         self._check_missing_options(typ, options, key)
         return options
@@ -266,7 +262,7 @@ class UiOptions(CoreSysAttributes):
 
     def __init__(self, coresys: CoreSys) -> None:
         """Initialize UI option render."""
-        self.coresys = coresys
+        self.coresys: CoreSys = coresys
 
     def __call__(self, raw_schema: dict[str, Any]) -> list[dict[str, Any]]:
         """Generate UI schema."""
@@ -274,17 +270,27 @@ class UiOptions(CoreSysAttributes):
 
         # read options
         for key, value in raw_schema.items():
-            if isinstance(value, list):
-                # nested value list
-                self._nested_ui_list(ui_schema, value, key)
-            elif isinstance(value, dict):
-                # nested value dict
-                self._nested_ui_dict(ui_schema, value, key)
-            else:
-                # normal value
-                self._single_ui_option(ui_schema, value, key)
+            self._ui_schema_element(ui_schema, value, key)
 
         return ui_schema
+
+    def _ui_schema_element(
+        self,
+        ui_schema: list[dict[str, Any]],
+        value: str | list[Any] | dict[str, Any],
+        key: str,
+        multiple: bool = False,
+    ) -> None:
+        if isinstance(value, list):
+            # nested value list
+            assert not multiple
+            self._nested_ui_list(ui_schema, value, key)
+        elif isinstance(value, dict):
+            # nested value dict
+            self._nested_ui_dict(ui_schema, value, key, multiple)
+        else:
+            # normal value
+            self._single_ui_option(ui_schema, value, key, multiple)
 
     def _single_ui_option(
         self,
@@ -377,10 +383,7 @@ class UiOptions(CoreSysAttributes):
             _LOGGER.error("Invalid schema %s", key)
             return
 
-        if isinstance(element, dict):
-            self._nested_ui_dict(ui_schema, element, key, multiple=True)
-        else:
-            self._single_ui_option(ui_schema, element, key, multiple=True)
+        self._ui_schema_element(ui_schema, element, key, multiple=True)
 
     def _nested_ui_dict(
         self,
@@ -390,20 +393,16 @@ class UiOptions(CoreSysAttributes):
         multiple: bool = False,
     ) -> None:
         """UI nested dict items."""
-        ui_node = {
+        ui_node: dict[str, Any] = {
             "name": key,
             "type": "schema",
             "optional": True,
             "multiple": multiple,
         }
 
-        nested_schema = []
+        nested_schema: list[dict[str, Any]] = []
         for c_key, c_value in option_dict.items():
-            # Nested?
-            if isinstance(c_value, list):
-                self._nested_ui_list(nested_schema, c_value, c_key)
-            else:
-                self._single_ui_option(nested_schema, c_value, c_key)
+            self._ui_schema_element(nested_schema, c_value, c_key)
 
         ui_node["schema"] = nested_schema
         ui_schema.append(ui_node)
@@ -413,7 +412,7 @@ def _create_device_filter(str_filter: str) -> dict[str, Any]:
     """Generate device Filter."""
     raw_filter = dict(value.split("=") for value in str_filter.split(";"))
 
-    clean_filter = {}
+    clean_filter: dict[str, Any] = {}
     for key, value in raw_filter.items():
         if key == "subsystem":
             clean_filter[key] = UdevSubsystem(value)

@@ -11,10 +11,12 @@ import zlib_fast
 # Enable fast zlib before importing supervisor
 zlib_fast.enable()
 
-from supervisor import bootstrap  # pylint: disable=wrong-import-position # noqa: E402
-from supervisor.utils.logging import (  # pylint: disable=wrong-import-position  # noqa: E402
-    activate_log_queue_handler,
-)
+# pylint: disable=wrong-import-position
+from supervisor import bootstrap  # noqa: E402
+from supervisor.utils.blockbuster import BlockBusterManager  # noqa: E402
+from supervisor.utils.logging import activate_log_queue_handler  # noqa: E402
+
+# pylint: enable=wrong-import-position
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -52,10 +54,11 @@ if __name__ == "__main__":
     _LOGGER.info("Initializing Supervisor setup")
     coresys = loop.run_until_complete(bootstrap.initialize_coresys())
     loop.set_debug(coresys.config.debug)
+    if coresys.config.detect_blocking_io:
+        BlockBusterManager.activate()
     loop.run_until_complete(coresys.core.connect())
 
-    bootstrap.supervisor_debugger(coresys)
-    bootstrap.migrate_system_env(coresys)
+    loop.run_until_complete(bootstrap.supervisor_debugger(coresys))
 
     # Signal health startup for container
     run_os_startup_check_cleanup()
@@ -63,8 +66,28 @@ if __name__ == "__main__":
     _LOGGER.info("Setting up Supervisor")
     loop.run_until_complete(coresys.core.setup())
 
-    loop.call_soon_threadsafe(loop.create_task, coresys.core.start())
-    loop.call_soon_threadsafe(bootstrap.reg_signal, loop, coresys)
+    # Create startup task that can be cancelled gracefully
+    startup_task = loop.create_task(coresys.core.start())
+
+    def shutdown_handler() -> None:
+        """Handle shutdown signals gracefully during startup."""
+        if not startup_task.done():
+            _LOGGER.warning("Supervisor startup interrupted by shutdown signal")
+            startup_task.cancel()
+
+        coresys.create_task(coresys.core.stop())
+
+    bootstrap.register_signal_handlers(loop, shutdown_handler)
+
+    try:
+        loop.run_until_complete(startup_task)
+    except asyncio.CancelledError:
+        _LOGGER.warning("Supervisor startup cancelled")
+    except Exception as err:  # pylint: disable=broad-except
+        # Supervisor itself is running at this point, just something didn't
+        # start as expected. Log with traceback to get more insights for
+        # such cases.
+        _LOGGER.critical("Supervisor start failed: %s", err, exc_info=True)
 
     try:
         _LOGGER.info("Running Supervisor")

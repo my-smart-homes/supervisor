@@ -1,7 +1,8 @@
 """Home Assistant control object."""
 
 import asyncio
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
@@ -10,12 +11,11 @@ from typing import Any
 import aiohttp
 from aiohttp import hdrs
 from awesomeversion import AwesomeVersion
+from multidict import MultiMapping
 
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HomeAssistantAPIError, HomeAssistantAuthError
-from ..jobs.const import JobExecutionLimit
-from ..jobs.decorator import Job
-from ..utils import check_port, version_is_new_enough
+from ..utils import version_is_new_enough
 from .const import LANDINGPAGE
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -41,23 +41,38 @@ class HomeAssistantAPI(CoreSysAttributes):
         # We don't persist access tokens. Instead we fetch new ones when needed
         self.access_token: str | None = None
         self._access_token_expires: datetime | None = None
+        self._token_lock: asyncio.Lock = asyncio.Lock()
 
-    @Job(
-        name="home_assistant_api_ensure_access_token",
-        limit=JobExecutionLimit.SINGLE_WAIT,
-        internal=True,
-    )
     async def ensure_access_token(self) -> None:
-        """Ensure there is an access token."""
-        if self.access_token is not None and self._access_token_expires > datetime.now(
-            tz=UTC
+        """Ensure there is a valid access token.
+
+        Raises:
+            HomeAssistantAuthError: When we cannot get a valid token
+            aiohttp.ClientError: On network or connection errors
+            TimeoutError: On request timeouts
+
+        """
+        # Fast path check without lock (avoid unnecessary locking
+        # for the majority of calls).
+        if (
+            self.access_token
+            and self._access_token_expires
+            and self._access_token_expires > datetime.now(tz=UTC)
         ):
             return
 
-        with suppress(asyncio.TimeoutError, aiohttp.ClientError):
+        async with self._token_lock:
+            # Double-check after acquiring lock (avoid race condition)
+            if (
+                self.access_token
+                and self._access_token_expires
+                and self._access_token_expires > datetime.now(tz=UTC)
+            ):
+                return
+
             async with self.sys_websession.post(
                 f"{self.sys_homeassistant.api_url}/auth/token",
-                timeout=30,
+                timeout=aiohttp.ClientTimeout(total=30),
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": self.sys_homeassistant.refresh_token,
@@ -84,11 +99,40 @@ class HomeAssistantAPI(CoreSysAttributes):
         json: dict[str, Any] | None = None,
         content_type: str | None = None,
         data: Any = None,
-        timeout: int = 30,
-        params: dict[str, str] | None = None,
+        timeout: int | None = 30,
+        params: MultiMapping[str] | None = None,
         headers: dict[str, str] | None = None,
-    ) -> AbstractAsyncContextManager[aiohttp.ClientResponse]:
-        """Async context manager to make a request with right auth."""
+    ) -> AsyncIterator[aiohttp.ClientResponse]:
+        """Async context manager to make authenticated requests to Home Assistant API.
+
+        This context manager handles authentication token management automatically,
+        including token refresh on 401 responses. It yields the HTTP response
+        for the caller to handle.
+
+        Error Handling:
+        - HTTP error status codes (4xx, 5xx) are preserved in the response
+        - Authentication is handled transparently with one retry on 401
+        - Network/connection failures raise HomeAssistantAPIError
+        - No logging is performed - callers should handle logging as needed
+
+        Args:
+            method: HTTP method (get, post, etc.)
+            path: API path relative to Home Assistant base URL
+            json: JSON data to send in request body
+            content_type: Override content-type header
+            data: Raw data to send in request body
+            timeout: Request timeout in seconds
+            params: URL query parameters
+            headers: Additional HTTP headers
+
+        Yields:
+            aiohttp.ClientResponse: The HTTP response object
+
+        Raises:
+            HomeAssistantAPIError: When request cannot be completed due to
+                network errors, timeouts, or connection failures
+
+        """
         url = f"{self.sys_homeassistant.api_url}/{path}"
         headers = headers or {}
 
@@ -97,10 +141,9 @@ class HomeAssistantAPI(CoreSysAttributes):
             headers[hdrs.CONTENT_TYPE] = content_type
 
         for _ in (1, 2):
-            await self.ensure_access_token()
-            headers[hdrs.AUTHORIZATION] = f"Bearer {self.access_token}"
-
             try:
+                await self.ensure_access_token()
+                headers[hdrs.AUTHORIZATION] = f"Bearer {self.access_token}"
                 async with getattr(self.sys_websession, method)(
                     url,
                     data=data,
@@ -116,23 +159,19 @@ class HomeAssistantAPI(CoreSysAttributes):
                         continue
                     yield resp
                     return
-            except TimeoutError:
-                _LOGGER.error("Timeout on call %s.", url)
-                break
+            except TimeoutError as err:
+                _LOGGER.debug("Timeout on call %s.", url)
+                raise HomeAssistantAPIError(str(err)) from err
             except aiohttp.ClientError as err:
-                _LOGGER.error("Error on call %s: %s", url, err)
-                break
-
-        raise HomeAssistantAPIError()
+                _LOGGER.debug("Error on call %s: %s", url, err)
+                raise HomeAssistantAPIError(str(err)) from err
 
     async def _get_json(self, path: str) -> dict[str, Any]:
         """Return Home Assistant get API."""
         async with self.make_request("get", path) as resp:
             if resp.status in (200, 201):
                 return await resp.json()
-            else:
-                _LOGGER.debug("Home Assistant API return: %d", resp.status)
-        raise HomeAssistantAPIError()
+            raise HomeAssistantAPIError(f"Home Assistant Core API return {resp.status}")
 
     async def get_config(self) -> dict[str, Any]:
         """Return Home Assistant config."""
@@ -151,15 +190,8 @@ class HomeAssistantAPI(CoreSysAttributes):
         ):
             return None
 
-        # Check if port is up
-        if not await check_port(
-            self.sys_homeassistant.ip_address,
-            self.sys_homeassistant.api_port,
-        ):
-            return None
-
         # Check if API is up
-        with suppress(HomeAssistantAPIError):
+        try:
             # get_core_state is available since 2023.8.0 and preferred
             # since it is significantly faster than get_config because
             # it does not require serializing the entire config
@@ -177,6 +209,8 @@ class HomeAssistantAPI(CoreSysAttributes):
                 migrating = recorder_state.get("migration_in_progress", False)
                 live_migration = recorder_state.get("migration_is_live", False)
                 return APIState(state, migrating and not live_migration)
+        except HomeAssistantAPIError as err:
+            _LOGGER.debug("Can't connect to Home Assistant API: %s", err)
 
         return None
 

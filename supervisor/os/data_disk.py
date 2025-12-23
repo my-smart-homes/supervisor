@@ -5,7 +5,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from awesomeversion import AwesomeVersion
 
@@ -22,11 +22,12 @@ from ..exceptions import (
     HassOSJobError,
     HostError,
 )
-from ..jobs.const import JobCondition, JobExecutionLimit
+from ..jobs.const import JobConcurrency, JobCondition
 from ..jobs.decorator import Job
+from ..resolution.checks.base import CheckBase
 from ..resolution.checks.disabled_data_disk import CheckDisabledDataDisk
 from ..resolution.checks.multiple_data_disks import CheckMultipleDataDisks
-from ..utils.sentry import capture_exception
+from ..utils.sentry import async_capture_exception
 from .const import (
     FILESYSTEM_LABEL_DATA_DISK,
     FILESYSTEM_LABEL_DISABLED_DATA_DISK,
@@ -149,7 +150,7 @@ class DataDisk(CoreSysAttributes):
         Available disks are drives where nothing on it has been mounted
         and it can be formatted.
         """
-        available: list[UDisks2Drive] = []
+        available: list[Disk] = []
         for drive in self.sys_dbus.udisks2.drives:
             block_devices = self._get_block_devices_for_drive(drive)
             primary = _get_primary_block_device(block_devices)
@@ -166,12 +167,16 @@ class DataDisk(CoreSysAttributes):
     @property
     def check_multiple_data_disks(self) -> CheckMultipleDataDisks:
         """Resolution center check for multiple data disks."""
-        return self.sys_resolution.check.get("multiple_data_disks")
+        return cast(
+            CheckMultipleDataDisks, self.sys_resolution.check.get("multiple_data_disks")
+        )
 
     @property
     def check_disabled_data_disk(self) -> CheckDisabledDataDisk:
         """Resolution center check for disabled data disk."""
-        return self.sys_resolution.check.get("disabled_data_disk")
+        return cast(
+            CheckDisabledDataDisk, self.sys_resolution.check.get("disabled_data_disk")
+        )
 
     def _get_block_devices_for_drive(self, drive: UDisks2Drive) -> list[UDisks2Block]:
         """Get block devices for a drive."""
@@ -189,18 +194,19 @@ class DataDisk(CoreSysAttributes):
             await self.sys_dbus.agent.datadisk.reload_device()
 
         # Register for signals on devices added/removed
-        self.sys_dbus.udisks2.udisks2_object_manager.dbus.object_manager.on_interfaces_added(
-            self._udisks2_interface_added
-        )
-        self.sys_dbus.udisks2.udisks2_object_manager.dbus.object_manager.on_interfaces_removed(
-            self._udisks2_interface_removed
-        )
+        if self.sys_dbus.udisks2.is_connected:
+            self.sys_dbus.udisks2.udisks2_object_manager.dbus.object_manager.on_interfaces_added(
+                self._udisks2_interface_added
+            )
+            self.sys_dbus.udisks2.udisks2_object_manager.dbus.object_manager.on_interfaces_removed(
+                self._udisks2_interface_removed
+            )
 
     @Job(
         name="data_disk_migrate",
         conditions=[JobCondition.HAOS, JobCondition.OS_AGENT, JobCondition.HEALTHY],
-        limit=JobExecutionLimit.ONCE,
         on_condition=HassOSJobError,
+        concurrency=JobConcurrency.REJECT,
     )
     async def migrate_disk(self, new_disk: str) -> None:
         """Move data partition to a new disk."""
@@ -299,8 +305,8 @@ class DataDisk(CoreSysAttributes):
     @Job(
         name="data_disk_wipe",
         conditions=[JobCondition.HAOS, JobCondition.OS_AGENT, JobCondition.HEALTHY],
-        limit=JobExecutionLimit.ONCE,
         on_condition=HassOSJobError,
+        concurrency=JobConcurrency.REJECT,
     )
     async def wipe_disk(self) -> None:
         """Wipe the current data disk."""
@@ -336,7 +342,7 @@ class DataDisk(CoreSysAttributes):
         try:
             await block_device.format(FormatType.GPT)
         except DBusError as err:
-            capture_exception(err)
+            await async_capture_exception(err)
             raise HassOSDataDiskError(
                 f"Could not format {new_disk.id}: {err!s}", _LOGGER.error
             ) from err
@@ -353,14 +359,14 @@ class DataDisk(CoreSysAttributes):
                 0, 0, LINUX_DATA_PARTITION_GUID, PARTITION_NAME_EXTERNAL_DATA_DISK
             )
         except DBusError as err:
-            capture_exception(err)
+            await async_capture_exception(err)
             raise HassOSDataDiskError(
                 f"Could not create new data partition: {err!s}", _LOGGER.error
             ) from err
 
         try:
             partition_block = await UDisks2Block.new(
-                partition, self.sys_dbus.bus, sync_properties=False
+                partition, self.sys_dbus.connected_bus, sync_properties=False
             )
         except DBusError as err:
             raise HassOSDataDiskError(
@@ -387,7 +393,7 @@ class DataDisk(CoreSysAttributes):
             properties[DBUS_IFACE_BLOCK][DBUS_ATTR_ID_LABEL]
             == FILESYSTEM_LABEL_DATA_DISK
         ):
-            check = self.check_multiple_data_disks
+            check: CheckBase = self.check_multiple_data_disks
         elif (
             properties[DBUS_IFACE_BLOCK][DBUS_ATTR_ID_LABEL]
             == FILESYSTEM_LABEL_DISABLED_DATA_DISK
@@ -410,7 +416,7 @@ class DataDisk(CoreSysAttributes):
             and issue.context == self.check_multiple_data_disks.context
             for issue in self.sys_resolution.issues
         ):
-            check = self.check_multiple_data_disks
+            check: CheckBase = self.check_multiple_data_disks
         elif any(
             issue.type == self.check_disabled_data_disk.issue
             and issue.context == self.check_disabled_data_disk.context

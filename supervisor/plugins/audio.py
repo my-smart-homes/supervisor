@@ -22,12 +22,13 @@ from ..exceptions import (
     AudioUpdateError,
     ConfigurationFileError,
     DockerError,
+    PluginError,
 )
-from ..jobs.const import JobExecutionLimit
+from ..jobs.const import JobThrottle
 from ..jobs.decorator import Job
 from ..resolution.const import UnhealthyReason
 from ..utils.json import write_json_file
-from ..utils.sentry import capture_exception
+from ..utils.sentry import async_capture_exception
 from .base import PluginBase
 from .const import (
     FILE_HASSIO_AUDIO,
@@ -88,11 +89,15 @@ class PluginAudio(PluginBase):
         # Initialize Client Template
         try:
             self.client_template = jinja2.Template(
-                PULSE_CLIENT_TMPL.read_text(encoding="utf-8")
+                await self.sys_run_in_executor(
+                    PULSE_CLIENT_TMPL.read_text, encoding="utf-8"
+                )
             )
         except OSError as err:
             if err.errno == errno.EBADMSG:
-                self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
+                )
 
             _LOGGER.error("Can't read pulse-client.tmpl: %s", err)
 
@@ -100,13 +105,19 @@ class PluginAudio(PluginBase):
 
         # Setup default asound config
         asound = self.sys_config.path_audio.joinpath("asound")
-        if not asound.exists():
-            try:
+
+        def setup_default_asound():
+            if not asound.exists():
                 shutil.copy(ASOUND_TMPL, asound)
-            except OSError as err:
-                if err.errno == errno.EBADMSG:
-                    self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
-                _LOGGER.error("Can't create default asound: %s", err)
+
+        try:
+            await self.sys_run_in_executor(setup_default_asound)
+        except OSError as err:
+            if err.errno == errno.EBADMSG:
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
+                )
+            _LOGGER.error("Can't create default asound: %s", err)
 
     @Job(
         name="plugin_audio_update",
@@ -117,13 +128,13 @@ class PluginAudio(PluginBase):
         """Update Audio plugin."""
         try:
             await super().update(version)
-        except DockerError as err:
+        except (DockerError, PluginError) as err:
             raise AudioUpdateError("Audio update failed", _LOGGER.error) from err
 
     async def restart(self) -> None:
         """Restart Audio plugin."""
         _LOGGER.info("Restarting Audio plugin")
-        self._write_config()
+        await self._write_config()
         try:
             await self.instance.restart()
         except DockerError as err:
@@ -132,7 +143,7 @@ class PluginAudio(PluginBase):
     async def start(self) -> None:
         """Run Audio plugin."""
         _LOGGER.info("Starting Audio plugin")
-        self._write_config()
+        await self._write_config()
         try:
             await self.instance.run()
         except DockerError as err:
@@ -163,7 +174,7 @@ class PluginAudio(PluginBase):
             await self.instance.install(self.version)
         except DockerError as err:
             _LOGGER.error("Repair of Audio failed")
-            capture_exception(err)
+            await async_capture_exception(err)
 
     def pulse_client(self, input_profile=None, output_profile=None) -> str:
         """Generate an /etc/pulse/client.conf data."""
@@ -177,10 +188,11 @@ class PluginAudio(PluginBase):
             default_sink=output_profile,
         )
 
-    def _write_config(self):
+    async def _write_config(self):
         """Write pulse audio config."""
         try:
-            write_json_file(
+            await self.sys_run_in_executor(
+                write_json_file,
                 self.pulse_audio_config,
                 {
                     "debug": self.sys_config.logging == LogLevel.DEBUG,
@@ -193,10 +205,10 @@ class PluginAudio(PluginBase):
 
     @Job(
         name="plugin_audio_restart_after_problem",
-        limit=JobExecutionLimit.THROTTLE_RATE_LIMIT,
         throttle_period=WATCHDOG_THROTTLE_PERIOD,
         throttle_max_calls=WATCHDOG_THROTTLE_MAX_CALLS,
         on_condition=AudioJobError,
+        throttle=JobThrottle.RATE_LIMIT,
     )
     async def _restart_after_problem(self, state: ContainerState):
         """Restart unhealthy or failed plugin."""

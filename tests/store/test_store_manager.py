@@ -1,5 +1,7 @@
 """Test store manager."""
 
+from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import PropertyMock, patch
 
@@ -7,12 +9,10 @@ from awesomeversion import AwesomeVersion
 import pytest
 
 from supervisor.addons.addon import Addon
-from supervisor.arch import CpuArch
+from supervisor.arch import CpuArchManager
 from supervisor.backups.manager import BackupManager
-from supervisor.bootstrap import migrate_system_env
-from supervisor.const import ATTR_ADDONS_CUSTOM_LIST
 from supervisor.coresys import CoreSys
-from supervisor.exceptions import AddonsNotSupportedError, StoreJobError
+from supervisor.exceptions import AddonNotSupportedError, StoreJobError
 from supervisor.homeassistant.module import HomeAssistant
 from supervisor.store import StoreManager
 from supervisor.store.addon import AddonStore
@@ -24,7 +24,7 @@ from tests.common import load_yaml_fixture
 
 async def test_default_load(coresys: CoreSys):
     """Test default load from config."""
-    store_manager = StoreManager(coresys)
+    store_manager = await StoreManager(coresys).load_config()
     refresh_cache_calls: set[str] = set()
 
     async def mock_refresh_cache(obj: AddonStore):
@@ -32,7 +32,8 @@ async def test_default_load(coresys: CoreSys):
         refresh_cache_calls.add(obj.slug)
 
     with (
-        patch("supervisor.store.repository.Repository.load", return_value=None),
+        patch("supervisor.store.repository.RepositoryGit.load", return_value=None),
+        patch("supervisor.store.repository.RepositoryLocal.load", return_value=None),
         patch.object(type(coresys.config), "addons_repositories", return_value=[]),
         patch("pathlib.Path.exists", return_value=True),
         patch.object(AddonStore, "refresh_path_cache", new=mock_refresh_cache),
@@ -77,12 +78,16 @@ async def test_load_with_custom_repository(coresys: CoreSys):
         ),
         patch("pathlib.Path.is_file", return_value=True),
     ):
-        store_manager = StoreManager(coresys)
+        store_manager = await StoreManager(coresys).load_config()
 
     with (
-        patch("supervisor.store.repository.Repository.load", return_value=None),
+        patch("supervisor.store.repository.RepositoryGit.load", return_value=None),
+        patch("supervisor.store.repository.RepositoryLocal.load", return_value=None),
         patch.object(type(coresys.config), "addons_repositories", return_value=[]),
-        patch("supervisor.store.repository.Repository.validate", return_value=True),
+        patch("supervisor.store.repository.RepositoryGit.validate", return_value=True),
+        patch(
+            "supervisor.store.repository.RepositoryLocal.validate", return_value=True
+        ),
         patch("pathlib.Path.exists", return_value=True),
         patch.object(AddonStore, "refresh_path_cache", new=mock_refresh_cache),
     ):
@@ -105,45 +110,6 @@ async def test_load_with_custom_repository(coresys: CoreSys):
         in store_manager.repository_urls
     )
     assert "http://example.com" in store_manager.repository_urls
-
-
-async def test_load_from_core_config(coresys: CoreSys):
-    """Test custom repositories loaded from core config when present."""
-    # pylint: disable=protected-access
-    coresys.config._data[ATTR_ADDONS_CUSTOM_LIST] = ["http://example.com"]
-    assert coresys.config.addons_repositories == ["http://example.com"]
-
-    migrate_system_env(coresys)
-
-    with (
-        patch("supervisor.store.repository.Repository.load", return_value=None),
-        patch("supervisor.store.repository.Repository.validate", return_value=True),
-        patch("pathlib.Path.exists", return_value=True),
-    ):
-        await coresys.store.load()
-
-    assert len(coresys.store.all) == 6
-    assert isinstance(coresys.store.get("core"), Repository)
-    assert isinstance(coresys.store.get("local"), Repository)
-
-    assert len(coresys.store.repository_urls) == 4
-    assert (
-        "https://github.com/hassio-addons/repository" in coresys.store.repository_urls
-    )
-    assert (
-        "https://github.com/esphome/home-assistant-addon"
-        in coresys.store.repository_urls
-    )
-    assert (
-        "https://github.com/music-assistant/home-assistant-addon"
-        in coresys.store.repository_urls
-    )
-    assert "http://example.com" in coresys.store.repository_urls
-
-    assert coresys.config.addons_repositories == []
-
-    coresys.config.save_data.assert_called_once()
-    coresys.store.save_data.assert_called_once()
 
 
 async def test_reload_fails_if_out_of_date(coresys: CoreSys):
@@ -187,7 +153,9 @@ async def test_update_unavailable_addon(
 ):
     """Test updating addon when new version not available for system."""
     addon_config = dict(
-        load_yaml_fixture("addons/local/ssh/config.yaml"),
+        await coresys.run_in_executor(
+            load_yaml_fixture, "addons/local/ssh/config.yaml"
+        ),
         version=AwesomeVersion("10.0.0"),
         **config,
     )
@@ -195,16 +163,18 @@ async def test_update_unavailable_addon(
     with (
         patch.object(BackupManager, "do_backup_partial") as backup,
         patch.object(AddonStore, "data", new=PropertyMock(return_value=addon_config)),
-        patch.object(CpuArch, "supported", new=PropertyMock(return_value=["amd64"])),
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+        ),
         patch.object(CoreSys, "machine", new=PropertyMock(return_value="qemux86-64")),
         patch.object(
             HomeAssistant,
             "version",
             new=PropertyMock(return_value=AwesomeVersion("2022.1.1")),
         ),
-        patch("shutil.disk_usage", return_value=(42, 42, (1024.0**3))),
+        patch("shutil.disk_usage", return_value=(42, 42, (5120.0**3))),
     ):
-        with pytest.raises(AddonsNotSupportedError):
+        with pytest.raises(AddonNotSupportedError):
             await coresys.addons.update("local_ssh", backup=True)
 
         backup.assert_not_called()
@@ -235,36 +205,41 @@ async def test_update_unavailable_addon(
 )
 async def test_install_unavailable_addon(
     coresys: CoreSys,
-    repository: Repository,
+    test_repository: Repository,
     caplog: pytest.LogCaptureFixture,
     config: dict[str, Any],
     log: str,
 ):
     """Test updating addon when new version not available for system."""
     addon_config = dict(
-        load_yaml_fixture("addons/local/ssh/config.yaml"),
+        await coresys.run_in_executor(
+            load_yaml_fixture, "addons/local/ssh/config.yaml"
+        ),
         version=AwesomeVersion("10.0.0"),
         **config,
     )
 
     with (
         patch.object(AddonStore, "data", new=PropertyMock(return_value=addon_config)),
-        patch.object(CpuArch, "supported", new=PropertyMock(return_value=["amd64"])),
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+        ),
         patch.object(CoreSys, "machine", new=PropertyMock(return_value="qemux86-64")),
         patch.object(
             HomeAssistant,
             "version",
             new=PropertyMock(return_value=AwesomeVersion("2022.1.1")),
         ),
-        patch("shutil.disk_usage", return_value=(42, 42, (1024.0**3))),
-        pytest.raises(AddonsNotSupportedError),
+        patch("shutil.disk_usage", return_value=(42, 42, (5120.0**3))),
+        pytest.raises(AddonNotSupportedError),
     ):
         await coresys.addons.install("local_ssh")
 
     assert log in caplog.text
 
 
-async def test_reload(coresys: CoreSys):
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_reload(coresys: CoreSys, supervisor_internet):
     """Test store reload."""
     await coresys.store.load()
     assert len(coresys.store.all) == 5
@@ -286,5 +261,12 @@ async def test_addon_version_timestamp(coresys: CoreSys, install_addon_example: 
 
     # If a new version is seen processing repo, reset to utc now
     install_addon_example.data_store["version"] = "1.1.0"
-    await coresys.store.reload()
+
+    with patch(
+        "pathlib.Path.stat",
+        return_value=SimpleNamespace(
+            st_mode=0o100644, st_mtime=datetime.now().timestamp()
+        ),
+    ):
+        await coresys.store.reload()
     assert timestamp < install_addon_example.latest_version_timestamp

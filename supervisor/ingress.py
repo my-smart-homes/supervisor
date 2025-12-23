@@ -12,8 +12,10 @@ from .const import (
     ATTR_SESSION_DATA,
     FILE_HASSIO_INGRESS,
     IngressSessionData,
+    IngressSessionDataDict,
 )
 from .coresys import CoreSys, CoreSysAttributes
+from .exceptions import HomeAssistantAPIError
 from .utils import check_port
 from .utils.common import FileConfiguration
 from .utils.dt import utc_from_timestamp, utcnow
@@ -35,7 +37,7 @@ class Ingress(FileConfiguration, CoreSysAttributes):
         """Return addon they have this ingress token."""
         if token not in self.tokens:
             return None
-        return self.sys_addons.get(self.tokens[token], local_only=True)
+        return self.sys_addons.get_local_only(self.tokens[token])
 
     def get_session_data(self, session_id: str) -> IngressSessionData | None:
         """Return complementary data of current session or None."""
@@ -49,7 +51,7 @@ class Ingress(FileConfiguration, CoreSysAttributes):
         return self._data[ATTR_SESSION]
 
     @property
-    def sessions_data(self) -> dict[str, dict[str, str | None]]:
+    def sessions_data(self) -> dict[str, IngressSessionDataDict]:
         """Return sessions_data."""
         return self._data[ATTR_SESSION_DATA]
 
@@ -82,14 +84,14 @@ class Ingress(FileConfiguration, CoreSysAttributes):
 
     async def unload(self) -> None:
         """Shutdown sessions."""
-        self.save_data()
+        await self.save_data()
 
     def _cleanup_sessions(self) -> None:
         """Remove not used sessions."""
         now = utcnow()
 
         sessions = {}
-        sessions_data: dict[str, dict[str, str | None]] = {}
+        sessions_data: dict[str, IngressSessionDataDict] = {}
         for session, valid in self.sessions.items():
             # check if timestamp valid, to avoid crash on malformed timestamp
             try:
@@ -118,7 +120,8 @@ class Ingress(FileConfiguration, CoreSysAttributes):
 
         # Read all ingress token and build a map
         for addon in self.addons:
-            self.tokens[addon.ingress_token] = addon.slug
+            if addon.ingress_token:
+                self.tokens[addon.ingress_token] = addon.slug
 
     def create_session(self, data: IngressSessionData | None = None) -> str:
         """Create new session."""
@@ -141,7 +144,7 @@ class Ingress(FileConfiguration, CoreSysAttributes):
         try:
             valid_until = utc_from_timestamp(self.sessions[session])
         except OverflowError:
-            self.sessions[session] = utcnow() + timedelta(minutes=15)
+            self.sessions[session] = (utcnow() + timedelta(minutes=15)).timestamp()
             return True
 
         # Is still valid?
@@ -170,16 +173,16 @@ class Ingress(FileConfiguration, CoreSysAttributes):
 
         # Save port for next time
         self.ports[addon_slug] = port
-        self.save_data()
+        await self.save_data()
         return port
 
-    def del_dynamic_port(self, addon_slug: str) -> None:
+    async def del_dynamic_port(self, addon_slug: str) -> None:
         """Remove a previously assigned dynamic port."""
         if addon_slug not in self.ports:
             return
 
         del self.ports[addon_slug]
-        self.save_data()
+        await self.save_data()
 
     async def update_hass_panel(self, addon: Addon):
         """Return True if Home Assistant up and running."""
@@ -189,12 +192,17 @@ class Ingress(FileConfiguration, CoreSysAttributes):
 
         # Update UI
         method = "post" if addon.ingress_panel else "delete"
-        async with self.sys_homeassistant.api.make_request(
-            method, f"api/hassio_push/panel/{addon.slug}"
-        ) as resp:
-            if resp.status in (200, 201):
-                _LOGGER.info("Update Ingress as panel for %s", addon.slug)
-            else:
-                _LOGGER.warning(
-                    "Fails Ingress panel for %s with %i", addon.slug, resp.status
-                )
+        try:
+            async with self.sys_homeassistant.api.make_request(
+                method, f"api/hassio_push/panel/{addon.slug}"
+            ) as resp:
+                if resp.status in (200, 201):
+                    _LOGGER.info("Update Ingress as panel for %s", addon.slug)
+                else:
+                    _LOGGER.warning(
+                        "Failed to update the Ingress panel for %s with %i",
+                        addon.slug,
+                        resp.status,
+                    )
+        except HomeAssistantAPIError as err:
+            _LOGGER.error("Panel update request failed for %s: %s", addon.slug, err)

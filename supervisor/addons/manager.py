@@ -5,27 +5,26 @@ from collections.abc import Awaitable
 from contextlib import suppress
 import logging
 import tarfile
-from typing import Union
+from typing import Self, Union
+
+from attr import evolve
 
 from ..const import AddonBoot, AddonStartup, AddonState
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
-    AddonConfigurationError,
+    AddonNotSupportedError,
     AddonsError,
     AddonsJobError,
-    AddonsNotSupportedError,
     CoreDNSError,
-    DockerAPIError,
     DockerError,
-    DockerNotFound,
     HassioError,
-    HomeAssistantAPIError,
 )
+from ..jobs import ChildJobSyncFilter
+from ..jobs.const import JobConcurrency
 from ..jobs.decorator import Job, JobCondition
 from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..store.addon import AddonStore
-from ..utils import check_exception_chain
-from ..utils.sentry import capture_exception
+from ..utils.sentry import async_capture_exception
 from .addon import Addon
 from .const import ADDON_UPDATE_CONDITIONS
 from .data import AddonsData
@@ -69,12 +68,21 @@ class AddonManager(CoreSysAttributes):
             return self.store.get(addon_slug)
         return None
 
+    def get_local_only(self, addon_slug: str) -> Addon | None:
+        """Return an installed add-on from slug."""
+        return self.local.get(addon_slug)
+
     def from_token(self, token: str) -> Addon | None:
         """Return an add-on from Supervisor token."""
         for addon in self.installed:
             if token == addon.supervisor_token:
                 return addon
         return None
+
+    async def load_config(self) -> Self:
+        """Load config in executor."""
+        await self.data.read_data()
+        return self
 
     async def load(self) -> None:
         """Start up add-on management."""
@@ -118,15 +126,14 @@ class AddonManager(CoreSysAttributes):
             try:
                 if start_task := await addon.start():
                     wait_boot.append(start_task)
-            except AddonsError as err:
-                # Check if there is an system/user issue
-                if check_exception_chain(
-                    err, (DockerAPIError, DockerNotFound, AddonConfigurationError)
-                ):
-                    addon.boot = AddonBoot.MANUAL
-                    addon.save_persist()
             except HassioError:
-                pass  # These are already handled
+                self.sys_resolution.add_issue(
+                    evolve(addon.boot_failed_issue),
+                    suggestions=[
+                        SuggestionType.EXECUTE_START,
+                        SuggestionType.DISABLE_BOOT,
+                    ],
+                )
             else:
                 continue
 
@@ -134,6 +141,19 @@ class AddonManager(CoreSysAttributes):
 
         # Ignore exceptions from waiting for addon startup, addon errors handled elsewhere
         await asyncio.gather(*wait_boot, return_exceptions=True)
+
+        # After waiting for startup, create an issue for boot addons that are error or unknown state
+        # Ignore stopped as single shot addons can be run at boot and this is successful exit
+        # Timeout waiting for startup is not a failure, addon is probably just slow
+        for addon in tasks:
+            if addon.state in {AddonState.ERROR, AddonState.UNKNOWN}:
+                self.sys_resolution.add_issue(
+                    evolve(addon.boot_failed_issue),
+                    suggestions=[
+                        SuggestionType.EXECUTE_START,
+                        SuggestionType.DISABLE_BOOT,
+                    ],
+                )
 
     async def shutdown(self, stage: AddonStartup) -> None:
         """Shutdown addons."""
@@ -155,14 +175,20 @@ class AddonManager(CoreSysAttributes):
                 await addon.stop()
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Can't stop Add-on %s: %s", addon.slug, err)
-                capture_exception(err)
+                await async_capture_exception(err)
 
     @Job(
         name="addon_manager_install",
         conditions=ADDON_UPDATE_CONDITIONS,
         on_condition=AddonsJobError,
+        concurrency=JobConcurrency.QUEUE,
+        child_job_syncs=[
+            ChildJobSyncFilter("docker_interface_install", progress_allocation=1.0)
+        ],
     )
-    async def install(self, slug: str) -> None:
+    async def install(
+        self, slug: str, *, validation_complete: asyncio.Event | None = None
+    ) -> None:
         """Install an add-on."""
         self.sys_jobs.current.reference = slug
 
@@ -175,10 +201,15 @@ class AddonManager(CoreSysAttributes):
 
         store.validate_availability()
 
+        # If being run in the background, notify caller that validation has completed
+        if validation_complete:
+            validation_complete.set()
+
         await Addon(self.coresys, slug).install()
 
         _LOGGER.info("Add-on '%s' successfully installed", slug)
 
+    @Job(name="addon_manager_uninstall")
     async def uninstall(self, slug: str, *, remove_config: bool = False) -> None:
         """Remove an add-on."""
         if slug not in self.local:
@@ -201,9 +232,20 @@ class AddonManager(CoreSysAttributes):
         name="addon_manager_update",
         conditions=ADDON_UPDATE_CONDITIONS,
         on_condition=AddonsJobError,
+        # We assume for now the docker image pull is 100% of this task for progress
+        # allocation. But from a user perspective that isn't true. Other steps
+        # that take time which is not accounted for in progress include:
+        # partial backup, image cleanup, apparmor update, and addon restart
+        child_job_syncs=[
+            ChildJobSyncFilter("docker_interface_install", progress_allocation=1.0)
+        ],
     )
     async def update(
-        self, slug: str, backup: bool | None = False
+        self,
+        slug: str,
+        backup: bool | None = False,
+        *,
+        validation_complete: asyncio.Event | None = None,
     ) -> asyncio.Task | None:
         """Update add-on.
 
@@ -228,6 +270,10 @@ class AddonManager(CoreSysAttributes):
         # Check if available, Maybe something have changed
         store.validate_availability()
 
+        # If being run in the background, notify caller that validation has completed
+        if validation_complete:
+            validation_complete.set()
+
         if backup:
             await self.sys_backups.do_backup_partial(
                 name=f"addon_{addon.slug}_{addon.version}",
@@ -235,7 +281,10 @@ class AddonManager(CoreSysAttributes):
                 addons=[addon.slug],
             )
 
-        return await addon.update()
+        task = await addon.update()
+
+        _LOGGER.info("Add-on '%s' successfully updated", slug)
+        return task
 
     @Job(
         name="addon_manager_rebuild",
@@ -246,7 +295,7 @@ class AddonManager(CoreSysAttributes):
         ],
         on_condition=AddonsJobError,
     )
-    async def rebuild(self, slug: str) -> asyncio.Task | None:
+    async def rebuild(self, slug: str, *, force: bool = False) -> asyncio.Task | None:
         """Perform a rebuild of local build add-on.
 
         Returns a Task that completes when addon has state 'started' (see addon.start)
@@ -269,8 +318,8 @@ class AddonManager(CoreSysAttributes):
             raise AddonsError(
                 "Version changed, use Update instead Rebuild", _LOGGER.error
             )
-        if not addon.need_build:
-            raise AddonsNotSupportedError(
+        if not force and not addon.need_build:
+            raise AddonNotSupportedError(
                 "Can't rebuild a image based add-on", _LOGGER.error
             )
 
@@ -298,7 +347,7 @@ class AddonManager(CoreSysAttributes):
         if slug not in self.local:
             _LOGGER.debug("Add-on %s is not local available for restore", slug)
             addon = Addon(self.coresys, slug)
-            had_ingress = False
+            had_ingress: bool | None = False
         else:
             _LOGGER.debug("Add-on %s is local available for restore", slug)
             addon = self.local[slug]
@@ -314,8 +363,7 @@ class AddonManager(CoreSysAttributes):
         # Update ingress
         if had_ingress != addon.ingress_panel:
             await self.sys_ingress.reload()
-            with suppress(HomeAssistantAPIError):
-                await self.sys_ingress.update_hass_panel(addon)
+            await self.sys_ingress.update_hass_panel(addon)
 
         return wait_for_start
 
@@ -373,7 +421,7 @@ class AddonManager(CoreSysAttributes):
                     reference=addon.slug,
                     suggestions=[SuggestionType.EXECUTE_REPAIR],
                 )
-                capture_exception(err)
+                await async_capture_exception(err)
             else:
                 add_host_coros.append(
                     self.sys_plugins.dns.add_host(

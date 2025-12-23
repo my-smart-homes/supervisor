@@ -5,7 +5,7 @@ import logging
 
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import ResolutionNotFound
-from ..utils.sentry import capture_exception
+from ..utils.sentry import async_capture_exception
 from .const import UnhealthyReason, UnsupportedReason
 from .evaluations.base import EvaluateBase
 from .validate import get_valid_modules
@@ -13,7 +13,6 @@ from .validate import get_valid_modules
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 UNHEALTHY = [
-    UnsupportedReason.DOCKER_VERSION,
     UnsupportedReason.LXC,
     UnsupportedReason.PRIVILEGED,
 ]
@@ -28,20 +27,23 @@ class ResolutionEvaluation(CoreSysAttributes):
         self.cached_images: set[str] = set()
         self._evalutions: dict[str, EvaluateBase] = {}
 
-        self._load()
-
     @property
     def all_evaluations(self) -> list[EvaluateBase]:
         """Return all list of all checks."""
         return list(self._evalutions.values())
 
-    def _load(self):
-        """Load all checks."""
+    def load_modules(self) -> None:
+        """Load and setup all evaluations.
+
+        Must be run in executor.
+        """
         package = f"{__package__}.evaluations"
+        evaluations: dict[str, EvaluateBase] = {}
         for module in get_valid_modules("evaluations"):
-            check_module = import_module(f"{package}.{module}")
-            check = check_module.setup(self.coresys)
-            self._evalutions[check.slug] = check
+            evaluate_module = import_module(f"{package}.{module}")
+            evaluation = evaluate_module.setup(self.coresys)
+            evaluations[evaluation.slug] = evaluation
+        self._evalutions = evaluations
 
     def get(self, slug: str) -> EvaluateBase:
         """Return check based on slug."""
@@ -61,9 +63,9 @@ class ResolutionEvaluation(CoreSysAttributes):
                 _LOGGER.warning(
                     "Error during processing %s: %s", evaluation.reason, err
                 )
-                capture_exception(err)
+                await async_capture_exception(err)
 
         if any(reason in self.sys_resolution.unsupported for reason in UNHEALTHY):
-            self.sys_resolution.unhealthy = UnhealthyReason.DOCKER
+            self.sys_resolution.add_unhealthy_reason(UnhealthyReason.DOCKER)
 
         _LOGGER.info("System evaluation complete")

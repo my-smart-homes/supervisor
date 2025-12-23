@@ -2,20 +2,14 @@
 
 from abc import ABC, abstractmethod
 import asyncio
+from collections.abc import Callable
+from functools import cached_property
 import logging
 from pathlib import Path, PurePath
 
 from dbus_fast import Variant
 from voluptuous import Coerce
 
-from ..const import (
-    ATTR_NAME,
-    ATTR_PASSWORD,
-    ATTR_PORT,
-    ATTR_TYPE,
-    ATTR_USERNAME,
-    ATTR_VERSION,
-)
 from ..coresys import CoreSys, CoreSysAttributes
 from ..dbus.const import (
     DBUS_ATTR_ACTIVE_STATE,
@@ -29,6 +23,7 @@ from ..dbus.const import (
     UnitActiveState,
 )
 from ..dbus.systemd import SystemdUnit
+from ..docker.const import PATH_MEDIA, PATH_SHARE
 from ..exceptions import (
     DBusError,
     DBusSystemdNoSuchUnit,
@@ -38,23 +33,14 @@ from ..exceptions import (
 )
 from ..resolution.const import ContextType, IssueType
 from ..resolution.data import Issue
-from ..utils.sentry import capture_exception
-from .const import (
-    ATTR_PATH,
-    ATTR_READ_ONLY,
-    ATTR_SERVER,
-    ATTR_SHARE,
-    ATTR_USAGE,
-    MountCifsVersion,
-    MountType,
-    MountUsage,
-)
+from ..utils.sentry import async_capture_exception
+from .const import MountCifsVersion, MountType, MountUsage
 from .validate import MountData
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-COERCE_MOUNT_TYPE = Coerce(MountType)
-COERCE_MOUNT_USAGE = Coerce(MountUsage)
+COERCE_MOUNT_TYPE: Callable[[str], MountType] = Coerce(MountType)
+COERCE_MOUNT_USAGE: Callable[[str], MountUsage] = Coerce(MountUsage)
 
 
 class Mount(CoreSysAttributes, ABC):
@@ -68,6 +54,9 @@ class Mount(CoreSysAttributes, ABC):
         self._data: MountData = data
         self._unit: SystemdUnit | None = None
         self._state: UnitActiveState | None = None
+        self._failed_issue = Issue(
+            IssueType.MOUNT_FAILED, ContextType.MOUNT, reference=self.name
+        )
 
     @classmethod
     def from_dict(cls, coresys: CoreSys, data: MountData) -> "Mount":
@@ -75,7 +64,7 @@ class Mount(CoreSysAttributes, ABC):
         if cls not in [Mount, NetworkMount]:
             return cls(coresys, data)
 
-        type_ = COERCE_MOUNT_TYPE(data[ATTR_TYPE])
+        type_ = COERCE_MOUNT_TYPE(data["type"])
         if type_ == MountType.CIFS:
             return CIFSMount(coresys, data)
         if type_ == MountType.NFS:
@@ -85,32 +74,33 @@ class Mount(CoreSysAttributes, ABC):
     def to_dict(self, *, skip_secrets: bool = True) -> MountData:
         """Return dictionary representation."""
         return MountData(
-            name=self.name, type=self.type, usage=self.usage, read_only=self.read_only
+            name=self.name,
+            type=self.type,
+            usage=self.usage and self.usage.value,
+            read_only=self.read_only,
         )
 
     @property
     def name(self) -> str:
         """Get name."""
-        return self._data[ATTR_NAME]
+        return self._data["name"]
 
     @property
     def type(self) -> MountType:
         """Get mount type."""
-        return COERCE_MOUNT_TYPE(self._data[ATTR_TYPE])
+        return COERCE_MOUNT_TYPE(self._data["type"])
 
     @property
     def usage(self) -> MountUsage | None:
         """Get mount usage."""
-        return (
-            COERCE_MOUNT_USAGE(self._data[ATTR_USAGE])
-            if ATTR_USAGE in self._data
-            else None
-        )
+        if self._data["usage"] is None:
+            return None
+        return COERCE_MOUNT_USAGE(self._data["usage"])
 
     @property
     def read_only(self) -> bool:
         """Is mount read-only."""
-        return self._data.get(ATTR_READ_ONLY, False)
+        return self._data.get("read_only", False)
 
     @property
     @abstractmethod
@@ -145,52 +135,62 @@ class Mount(CoreSysAttributes, ABC):
     @property
     def state(self) -> UnitActiveState | None:
         """Get state of mount."""
-        return self._state
+        return UnitActiveState(self._state) if self._state is not None else None
+
+    @cached_property
+    def local_where(self) -> Path:
+        """Return where this is mounted within supervisor container."""
+        return self.sys_config.extern_to_local_path(self.where)
 
     @property
-    def local_where(self) -> Path | None:
-        """Return where this is mounted within supervisor container.
+    def container_where(self) -> PurePath | None:
+        """Return where this is made available in managed containers (core, addons, etc.).
 
-        This returns none if 'where' is not within supervisor's host data directory.
+        This returns none if it is not made available in managed containers.
         """
-        return (
-            self.sys_config.extern_to_local_path(self.where)
-            if self.where.is_relative_to(self.sys_config.path_extern_supervisor)
-            else None
-        )
+        match self.usage:
+            case MountUsage.MEDIA:
+                return PurePath(PATH_MEDIA, self.name)
+            case MountUsage.SHARE:
+                return PurePath(PATH_SHARE, self.name)
+        return None
 
     @property
     def failed_issue(self) -> Issue:
         """Get issue used if this mount has failed."""
-        return Issue(IssueType.MOUNT_FAILED, ContextType.MOUNT, reference=self.name)
+        return self._failed_issue
 
     async def is_mounted(self) -> bool:
         """Return true if successfully mounted and available."""
         return self.state == UnitActiveState.ACTIVE
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         """Return true if mounts are the same."""
         return isinstance(other, Mount) and self.name == other.name
+
+    def __hash__(self) -> int:
+        """Return hash of mount."""
+        return hash(self.name)
 
     async def load(self) -> None:
         """Initialize object."""
         # If there's no mount unit, mount it to make one
-        if not await self._update_unit():
+        if not (unit := await self._update_unit()):
             await self.mount()
             return
 
-        await self._update_state_await(not_state=UnitActiveState.ACTIVATING)
+        await self._update_state_await(unit, not_state=UnitActiveState.ACTIVATING)
 
         # If mount is not available, try to reload it
         if not await self.is_mounted():
             await self.reload()
 
-    async def _update_state(self) -> UnitActiveState | None:
+    async def _update_state(self, unit: SystemdUnit) -> None:
         """Update mount unit state."""
         try:
-            self._state = await self.unit.get_active_state()
+            self._state = await unit.get_active_state()
         except DBusError as err:
-            capture_exception(err)
+            await async_capture_exception(err)
             raise MountError(
                 f"Could not get active state of mount due to: {err!s}"
             ) from err
@@ -203,16 +203,16 @@ class Mount(CoreSysAttributes, ABC):
             self._unit = None
             self._state = None
         except DBusError as err:
-            capture_exception(err)
+            await async_capture_exception(err)
             raise MountError(f"Could not get mount unit due to: {err!s}") from err
         return self.unit
 
     async def update(self) -> bool:
         """Update info about mount from dbus. Return true if it is mounted and available."""
-        if not await self._update_unit():
+        if not (unit := await self._update_unit()):
             return False
 
-        await self._update_state()
+        await self._update_state(unit)
 
         # If active, dismiss corresponding failed mount issue if found
         if (
@@ -224,16 +224,14 @@ class Mount(CoreSysAttributes, ABC):
 
     async def _update_state_await(
         self,
+        unit: SystemdUnit,
         expected_states: list[UnitActiveState] | None = None,
         not_state: UnitActiveState = UnitActiveState.ACTIVATING,
     ) -> None:
         """Update state info about mount from dbus. Wait for one of expected_states to appear or state to change from not_state."""
-        if not self.unit:
-            return
-
         try:
-            async with asyncio.timeout(30), self.unit.properties_changed() as signal:
-                await self._update_state()
+            async with asyncio.timeout(30), unit.properties_changed() as signal:
+                await self._update_state(unit)
                 while (
                     expected_states
                     and self.state not in expected_states
@@ -258,8 +256,8 @@ class Mount(CoreSysAttributes, ABC):
 
     async def mount(self) -> None:
         """Mount using systemd."""
-        # If supervisor can see where it will mount, ensure there's an empty folder there
-        if self.local_where:
+
+        def ensure_empty_folder() -> None:
             if not self.local_where.exists():
                 _LOGGER.info(
                     "Creating folder for mount: %s", self.local_where.as_posix()
@@ -275,6 +273,8 @@ class Mount(CoreSysAttributes, ABC):
                     f"Cannot mount {self.name} at {self.local_where.as_posix()} because it is not empty",
                     _LOGGER.error,
                 )
+
+        await self.sys_run_in_executor(ensure_empty_folder)
 
         try:
             options = (
@@ -299,8 +299,8 @@ class Mount(CoreSysAttributes, ABC):
                 f"Could not mount {self.name} due to: {err!s}", _LOGGER.error
             ) from err
 
-        if await self._update_unit():
-            await self._update_state_await(not_state=UnitActiveState.ACTIVATING)
+        if unit := await self._update_unit():
+            await self._update_state_await(unit, not_state=UnitActiveState.ACTIVATING)
 
         if not await self.is_mounted():
             raise MountActivationError(
@@ -310,17 +310,17 @@ class Mount(CoreSysAttributes, ABC):
 
     async def unmount(self) -> None:
         """Unmount using systemd."""
-        if not await self._update_unit():
+        if not (unit := await self._update_unit()):
             _LOGGER.info("Mount %s is not mounted, skipping unmount", self.name)
             return
 
-        await self._update_state()
+        await self._update_state(unit)
         try:
             if self.state != UnitActiveState.FAILED:
                 await self.sys_dbus.systemd.stop_unit(self.unit_name, StopUnitMode.FAIL)
 
             await self._update_state_await(
-                [UnitActiveState.INACTIVE, UnitActiveState.FAILED]
+                unit, [UnitActiveState.INACTIVE, UnitActiveState.FAILED]
             )
 
             if self.state == UnitActiveState.FAILED:
@@ -343,22 +343,50 @@ class Mount(CoreSysAttributes, ABC):
             )
             await self.mount()
         except DBusError as err:
-            raise MountError(
-                f"Could not reload mount {self.name} due to: {err!s}", _LOGGER.error
-            ) from err
+            _LOGGER.error(
+                "Could not reload mount %s due to: %s. Trying a restart", self.name, err
+            )
+            await self._restart()
         else:
-            if await self._update_unit():
-                await self._update_state_await(not_state=UnitActiveState.ACTIVATING)
+            if unit := await self._update_unit():
+                await self._update_state_await(
+                    unit, not_state=UnitActiveState.ACTIVATING
+                )
 
             if not await self.is_mounted():
-                raise MountActivationError(
-                    f"Reloading {self.name} did not succeed. Check host logs for errors from mount or systemd unit {self.unit_name} for details.",
-                    _LOGGER.error,
+                _LOGGER.info(
+                    "Mount %s not correctly mounted after a reload. Trying a restart",
+                    self.name,
                 )
+                await self._restart()
 
         # If it is mounted now, dismiss corresponding issue if present
         if self.failed_issue in self.sys_resolution.issues:
             self.sys_resolution.dismiss_issue(self.failed_issue)
+
+    async def _restart(self) -> None:
+        """Restart mount unit to re-mount."""
+        try:
+            await self.sys_dbus.systemd.restart_unit(self.unit_name, StartUnitMode.FAIL)
+        except DBusSystemdNoSuchUnit:
+            _LOGGER.info(
+                "Mount %s is not mounted, mounting instead of restarting", self.name
+            )
+            await self.mount()
+            return
+        except DBusError as err:
+            raise MountError(
+                f"Could not restart mount {self.name} due to: {err!s}", _LOGGER.error
+            ) from err
+
+        if unit := await self._update_unit():
+            await self._update_state_await(unit, not_state=UnitActiveState.ACTIVATING)
+
+        if not await self.is_mounted():
+            raise MountActivationError(
+                f"Restarting {self.name} did not succeed. Check host logs for errors from mount or systemd unit {self.unit_name} for details.",
+                _LOGGER.error,
+            )
 
 
 class NetworkMount(Mount, ABC):
@@ -368,18 +396,18 @@ class NetworkMount(Mount, ABC):
         """Return dictionary representation."""
         out = MountData(server=self.server, **super().to_dict())
         if self.port is not None:
-            out[ATTR_PORT] = self.port
+            out["port"] = self.port
         return out
 
     @property
     def server(self) -> str:
         """Get server."""
-        return self._data[ATTR_SERVER]
+        return self._data["server"]
 
     @property
     def port(self) -> int | None:
         """Get port, returns none if using the protocol default."""
-        return self._data.get(ATTR_PORT)
+        return self._data.get("port")
 
     @property
     def where(self) -> PurePath:
@@ -407,31 +435,31 @@ class CIFSMount(NetworkMount):
     def to_dict(self, *, skip_secrets: bool = True) -> MountData:
         """Return dictionary representation."""
         out = MountData(share=self.share, **super().to_dict())
-        if not skip_secrets and self.username is not None:
-            out[ATTR_USERNAME] = self.username
-            out[ATTR_PASSWORD] = self.password
-        out[ATTR_VERSION] = self.version
+        if not skip_secrets and self.username is not None and self.password is not None:
+            out["username"] = self.username
+            out["password"] = self.password
+        out["version"] = self.version
         return out
 
     @property
     def share(self) -> str:
         """Get share."""
-        return self._data[ATTR_SHARE]
+        return self._data["share"]
 
     @property
     def username(self) -> str | None:
         """Get username, returns none if auth is not used."""
-        return self._data.get(ATTR_USERNAME)
+        return self._data.get("username")
 
     @property
     def password(self) -> str | None:
         """Get password, returns none if auth is not used."""
-        return self._data.get(ATTR_PASSWORD)
+        return self._data.get("password")
 
     @property
     def version(self) -> str | None:
-        """Get password, returns none if auth is not used."""
-        version = self._data.get(ATTR_VERSION)
+        """Get cifs version, returns none if using default."""
+        version = self._data.get("version")
         if version == MountCifsVersion.LEGACY_1_0:
             return "1.0"
         if version == MountCifsVersion.LEGACY_2_0:
@@ -470,17 +498,23 @@ class CIFSMount(NetworkMount):
     async def mount(self) -> None:
         """Mount using systemd."""
         if self.username and self.password:
-            if not self.path_credentials.exists():
-                self.path_credentials.touch(mode=0o600)
 
-            with self.path_credentials.open(mode="w") as cred_file:
-                cred_file.write(f"username={self.username}\npassword={self.password}")
+            def write_credentials() -> None:
+                if not self.path_credentials.exists():
+                    self.path_credentials.touch(mode=0o600)
+
+                with self.path_credentials.open(mode="w") as cred_file:
+                    cred_file.write(
+                        f"username={self.username}\npassword={self.password}"
+                    )
+
+            await self.sys_run_in_executor(write_credentials)
 
         await super().mount()
 
     async def unmount(self) -> None:
         """Unmount using systemd."""
-        self.path_credentials.unlink(missing_ok=True)
+        await self.sys_run_in_executor(self.path_credentials.unlink, missing_ok=True)
         await super().unmount()
 
 
@@ -494,7 +528,7 @@ class NFSMount(NetworkMount):
     @property
     def path(self) -> PurePath:
         """Get path."""
-        return PurePath(self._data[ATTR_PATH])
+        return PurePath(self._data["path"])
 
     @property
     def what(self) -> str:
@@ -514,6 +548,9 @@ class BindMount(Mount):
         self, coresys: CoreSys, data: MountData, *, where: PurePath | None = None
     ) -> None:
         """Initialize object."""
+        if where and not where.is_relative_to(coresys.config.path_extern_supervisor):
+            raise ValueError("Path must be within Supervisor's host data directory!")
+
         super().__init__(coresys, data)
         self._where = where
 
@@ -521,7 +558,7 @@ class BindMount(Mount):
     def create(
         coresys: CoreSys,
         name: str,
-        path: Path,
+        path: PurePath,
         usage: MountUsage | None = None,
         where: PurePath | None = None,
         read_only: bool = False,
@@ -546,7 +583,7 @@ class BindMount(Mount):
     @property
     def path(self) -> PurePath:
         """Get path."""
-        return PurePath(self._data[ATTR_PATH])
+        return PurePath(self._data["path"])
 
     @property
     def what(self) -> str:

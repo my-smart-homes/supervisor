@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Awaitable
 from contextlib import suppress
-from ipaddress import IPv4Address, ip_address
+from ipaddress import IPv4Address
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from socket import SocketIO
+import tempfile
+from typing import TYPE_CHECKING, Literal, cast
 
+import aiodocker
+from attr import evolve
 from awesomeversion import AwesomeVersion
 import docker
-from docker.types import Mount
+import docker.errors
 import requests
 
 from ..addons.build import AddonBuild
@@ -31,6 +35,7 @@ from ..coresys import CoreSys
 from ..exceptions import (
     CoreDNSError,
     DBusError,
+    DockerBuildError,
     DockerError,
     DockerJobError,
     DockerNotFound,
@@ -38,11 +43,12 @@ from ..exceptions import (
 )
 from ..hardware.const import PolicyGroup
 from ..hardware.data import Device
-from ..jobs.const import JobCondition, JobExecutionLimit
+from ..jobs.const import JobConcurrency, JobCondition
 from ..jobs.decorator import Job
-from ..resolution.const import ContextType, IssueType, SuggestionType
-from ..utils.sentry import capture_exception
+from ..resolution.const import CGROUP_V2_VERSION, ContextType, IssueType, SuggestionType
+from ..utils.sentry import async_capture_exception
 from .const import (
+    ADDON_BUILDER_IMAGE,
     ENV_TIME,
     ENV_TOKEN,
     ENV_TOKEN_OLD,
@@ -50,9 +56,22 @@ from .const import (
     MOUNT_DEV,
     MOUNT_DOCKER,
     MOUNT_UDEV,
+    PATH_ALL_ADDON_CONFIGS,
+    PATH_BACKUP,
+    PATH_HOMEASSISTANT_CONFIG,
+    PATH_HOMEASSISTANT_CONFIG_LEGACY,
+    PATH_LOCAL_ADDONS,
+    PATH_MEDIA,
+    PATH_PRIVATE_DATA,
+    PATH_PUBLIC_CONFIG,
+    PATH_SHARE,
+    PATH_SSL,
     Capabilities,
+    DockerMount,
+    MountBindOptions,
     MountType,
     PropagationMode,
+    Ulimit,
 )
 from .interface import DockerInterface
 
@@ -62,7 +81,7 @@ if TYPE_CHECKING:
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-NO_ADDDRESS = ip_address("0.0.0.0")
+NO_ADDDRESS = IPv4Address("0.0.0.0")
 
 
 class DockerAddon(DockerInterface):
@@ -90,10 +109,12 @@ class DockerAddon(DockerInterface):
         """Return IP address of this container."""
         if self.addon.host_network:
             return self.sys_docker.network.gateway
+        if not self._meta:
+            return NO_ADDDRESS
 
         # Extract IP-Address
         try:
-            return ip_address(
+            return IPv4Address(
                 self._meta["NetworkSettings"]["Networks"]["hassio"]["IPAddress"]
             )
         except (KeyError, TypeError, ValueError):
@@ -110,7 +131,7 @@ class DockerAddon(DockerInterface):
         return self.addon.version
 
     @property
-    def arch(self) -> str:
+    def arch(self) -> str | None:
         """Return arch of Docker image."""
         if self.addon.legacy:
             return self.sys_arch.default
@@ -122,9 +143,9 @@ class DockerAddon(DockerInterface):
         return DockerAddon.slug_to_name(self.addon.slug)
 
     @property
-    def environment(self) -> dict[str, str | None]:
+    def environment(self) -> dict[str, str | int | None]:
         """Return environment for Docker add-on."""
-        addon_env = self.addon.environment or {}
+        addon_env = cast(dict[str, str | int | None], self.addon.environment or {})
 
         # Provide options for legacy add-ons
         if self.addon.legacy:
@@ -253,7 +274,7 @@ class DockerAddon(DockerInterface):
         }
 
     @property
-    def network_mode(self) -> str | None:
+    def network_mode(self) -> Literal["host"] | None:
         """Return network mode for add-on."""
         if self.addon.host_network:
             return "host"
@@ -292,19 +313,30 @@ class DockerAddon(DockerInterface):
         return None
 
     @property
-    def ulimits(self) -> list[docker.types.Ulimit] | None:
+    def ulimits(self) -> list[Ulimit] | None:
         """Generate ulimits for add-on."""
-        limits: list[docker.types.Ulimit] = []
+        limits: list[Ulimit] = []
 
         # Need schedule functions
         if self.addon.with_realtime:
-            limits.append(docker.types.Ulimit(name="rtprio", soft=90, hard=99))
+            limits.append(Ulimit(name="rtprio", soft=90, hard=99))
 
             # Set available memory for memlock to 128MB
             mem = 128 * 1024 * 1024
-            limits.append(docker.types.Ulimit(name="memlock", soft=mem, hard=mem))
+            limits.append(Ulimit(name="memlock", soft=mem, hard=mem))
 
-        # Return None if no capabilities is present
+        # Add configurable ulimits from add-on config
+        for name, config in self.addon.ulimits.items():
+            if isinstance(config, int):
+                # Simple format: both soft and hard limits are the same
+                limits.append(Ulimit(name=name, soft=config, hard=config))
+            elif isinstance(config, dict):
+                # Detailed format: both soft and hard limits are mandatory
+                soft = config["soft"]
+                hard = config["hard"]
+                limits.append(Ulimit(name=name, soft=soft, hard=hard))
+
+        # Return None if no ulimits are present
         if limits:
             return limits
         return None
@@ -321,20 +353,20 @@ class DockerAddon(DockerInterface):
         return None
 
     @property
-    def mounts(self) -> list[Mount]:
+    def mounts(self) -> list[DockerMount]:
         """Return mounts for container."""
         addon_mapping = self.addon.map_volumes
 
-        target_data_path = ""
+        target_data_path: str | None = None
         if MappingType.DATA in addon_mapping:
             target_data_path = addon_mapping[MappingType.DATA].path
 
         mounts = [
             MOUNT_DEV,
-            Mount(
+            DockerMount(
                 type=MountType.BIND,
                 source=self.addon.path_extern_data.as_posix(),
-                target=target_data_path or "/data",
+                target=target_data_path or PATH_PRIVATE_DATA.as_posix(),
                 read_only=False,
             ),
         ]
@@ -342,10 +374,11 @@ class DockerAddon(DockerInterface):
         # setup config mappings
         if MappingType.CONFIG in addon_mapping:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_homeassistant.as_posix(),
-                    target=addon_mapping[MappingType.CONFIG].path or "/config",
+                    target=addon_mapping[MappingType.CONFIG].path
+                    or PATH_HOMEASSISTANT_CONFIG_LEGACY.as_posix(),
                     read_only=addon_mapping[MappingType.CONFIG].read_only,
                 )
             )
@@ -354,11 +387,11 @@ class DockerAddon(DockerInterface):
             # Map addon's public config folder if not using deprecated config option
             if self.addon.addon_config_used:
                 mounts.append(
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=self.addon.path_extern_config.as_posix(),
                         target=addon_mapping[MappingType.ADDON_CONFIG].path
-                        or "/config",
+                        or PATH_PUBLIC_CONFIG.as_posix(),
                         read_only=addon_mapping[MappingType.ADDON_CONFIG].read_only,
                     )
                 )
@@ -366,11 +399,11 @@ class DockerAddon(DockerInterface):
             # Map Home Assistant config in new way
             if MappingType.HOMEASSISTANT_CONFIG in addon_mapping:
                 mounts.append(
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=self.sys_config.path_extern_homeassistant.as_posix(),
                         target=addon_mapping[MappingType.HOMEASSISTANT_CONFIG].path
-                        or "/homeassistant",
+                        or PATH_HOMEASSISTANT_CONFIG.as_posix(),
                         read_only=addon_mapping[
                             MappingType.HOMEASSISTANT_CONFIG
                         ].read_only,
@@ -379,64 +412,68 @@ class DockerAddon(DockerInterface):
 
         if MappingType.ALL_ADDON_CONFIGS in addon_mapping:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_addon_configs.as_posix(),
                     target=addon_mapping[MappingType.ALL_ADDON_CONFIGS].path
-                    or "/addon_configs",
+                    or PATH_ALL_ADDON_CONFIGS.as_posix(),
                     read_only=addon_mapping[MappingType.ALL_ADDON_CONFIGS].read_only,
                 )
             )
 
         if MappingType.SSL in addon_mapping:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_ssl.as_posix(),
-                    target=addon_mapping[MappingType.SSL].path or "/ssl",
+                    target=addon_mapping[MappingType.SSL].path or PATH_SSL.as_posix(),
                     read_only=addon_mapping[MappingType.SSL].read_only,
                 )
             )
 
         if MappingType.ADDONS in addon_mapping:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_addons_local.as_posix(),
-                    target=addon_mapping[MappingType.ADDONS].path or "/addons",
+                    target=addon_mapping[MappingType.ADDONS].path
+                    or PATH_LOCAL_ADDONS.as_posix(),
                     read_only=addon_mapping[MappingType.ADDONS].read_only,
                 )
             )
 
         if MappingType.BACKUP in addon_mapping:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_backup.as_posix(),
-                    target=addon_mapping[MappingType.BACKUP].path or "/backup",
+                    target=addon_mapping[MappingType.BACKUP].path
+                    or PATH_BACKUP.as_posix(),
                     read_only=addon_mapping[MappingType.BACKUP].read_only,
                 )
             )
 
         if MappingType.SHARE in addon_mapping:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_share.as_posix(),
-                    target=addon_mapping[MappingType.SHARE].path or "/share",
+                    target=addon_mapping[MappingType.SHARE].path
+                    or PATH_SHARE.as_posix(),
                     read_only=addon_mapping[MappingType.SHARE].read_only,
-                    propagation=PropagationMode.RSLAVE,
+                    bind_options=MountBindOptions(propagation=PropagationMode.RSLAVE),
                 )
             )
 
         if MappingType.MEDIA in addon_mapping:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_media.as_posix(),
-                    target=addon_mapping[MappingType.MEDIA].path or "/media",
+                    target=addon_mapping[MappingType.MEDIA].path
+                    or PATH_MEDIA.as_posix(),
                     read_only=addon_mapping[MappingType.MEDIA].read_only,
-                    propagation=PropagationMode.RSLAVE,
+                    bind_options=MountBindOptions(propagation=PropagationMode.RSLAVE),
                 )
             )
 
@@ -448,7 +485,7 @@ class DockerAddon(DockerInterface):
                 if not Path(gpio_path).exists():
                     continue
                 mounts.append(
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=gpio_path,
                         target=gpio_path,
@@ -459,7 +496,7 @@ class DockerAddon(DockerInterface):
         # DeviceTree support
         if self.addon.with_devicetree:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source="/sys/firmware/devicetree/base",
                     target="/device-tree",
@@ -474,7 +511,7 @@ class DockerAddon(DockerInterface):
         # Kernel Modules support
         if self.addon.with_kernel_modules:
             mounts.append(
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source="/lib/modules",
                     target="/lib/modules",
@@ -493,19 +530,19 @@ class DockerAddon(DockerInterface):
         # Configuration Audio
         if self.addon.with_audio:
             mounts += [
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.addon.path_extern_pulse.as_posix(),
                     target="/etc/pulse/client.conf",
                     read_only=True,
                 ),
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_plugins.audio.path_extern_pulse.as_posix(),
                     target="/run/audio",
                     read_only=True,
                 ),
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_plugins.audio.path_extern_asound.as_posix(),
                     target="/etc/asound.conf",
@@ -516,13 +553,13 @@ class DockerAddon(DockerInterface):
         # System Journal access
         if self.addon.with_journald:
             mounts += [
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=SYSTEMD_JOURNAL_PERSISTENT.as_posix(),
                     target=SYSTEMD_JOURNAL_PERSISTENT.as_posix(),
                     read_only=True,
                 ),
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=SYSTEMD_JOURNAL_VOLATILE.as_posix(),
                     target=SYSTEMD_JOURNAL_VOLATILE.as_posix(),
@@ -534,8 +571,8 @@ class DockerAddon(DockerInterface):
 
     @Job(
         name="docker_addon_run",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def run(self) -> None:
         """Run Docker image."""
@@ -590,7 +627,7 @@ class DockerAddon(DockerInterface):
             )
         except CoreDNSError as err:
             _LOGGER.warning("Can't update DNS for %s", self.name)
-            capture_exception(err)
+            await async_capture_exception(err)
 
         # Hardware Access
         if self.addon.static_devices:
@@ -600,8 +637,8 @@ class DockerAddon(DockerInterface):
 
     @Job(
         name="docker_addon_update",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def update(
         self,
@@ -628,8 +665,8 @@ class DockerAddon(DockerInterface):
 
     @Job(
         name="docker_addon_install",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def install(
         self,
@@ -648,68 +685,117 @@ class DockerAddon(DockerInterface):
 
     async def _build(self, version: AwesomeVersion, image: str | None = None) -> None:
         """Build a Docker container."""
-        build_env = AddonBuild(self.coresys, self.addon)
-        if not build_env.is_valid:
-            _LOGGER.error("Invalid build environment, can't build this add-on!")
-            raise DockerError()
+        build_env = await AddonBuild(self.coresys, self.addon).load_config()
+        # Check if the build environment is valid, raises if not
+        await build_env.is_valid()
 
         _LOGGER.info("Starting build for %s:%s", self.image, version)
+
+        def build_image() -> tuple[str, str]:
+            if build_env.squash:
+                _LOGGER.warning(
+                    "Ignoring squash build option for %s as Docker BuildKit does not support it.",
+                    self.addon.slug,
+                )
+
+            addon_image_tag = f"{image or self.addon.image}:{version!s}"
+
+            docker_version = self.sys_docker.info.version
+            builder_version_tag = f"{docker_version.major}.{docker_version.minor}.{docker_version.micro}-cli"
+
+            builder_name = f"addon_builder_{self.addon.slug}"
+
+            # Remove dangling builder container if it exists by any chance
+            # E.g. because of an abrupt host shutdown/reboot during a build
+            with suppress(docker.errors.NotFound):
+                self.sys_docker.containers_legacy.get(builder_name).remove(
+                    force=True, v=True
+                )
+
+            # Generate Docker config with registry credentials for base image if needed
+            docker_config_path: Path | None = None
+            docker_config_content = build_env.get_docker_config_json()
+            temp_dir: tempfile.TemporaryDirectory | None = None
+
+            try:
+                if docker_config_content:
+                    # Create temporary directory for docker config
+                    temp_dir = tempfile.TemporaryDirectory(
+                        prefix="hassio_build_", dir=self.sys_config.path_tmp
+                    )
+                    docker_config_path = Path(temp_dir.name) / "config.json"
+                    docker_config_path.write_text(
+                        docker_config_content, encoding="utf-8"
+                    )
+                    _LOGGER.debug(
+                        "Created temporary Docker config for build at %s",
+                        docker_config_path,
+                    )
+
+                result = self.sys_docker.run_command(
+                    ADDON_BUILDER_IMAGE,
+                    version=builder_version_tag,
+                    name=builder_name,
+                    **build_env.get_docker_args(
+                        version, addon_image_tag, docker_config_path
+                    ),
+                )
+            finally:
+                # Clean up temporary directory
+                if temp_dir:
+                    temp_dir.cleanup()
+
+            logs = result.output.decode("utf-8")
+
+            if result.exit_code != 0:
+                error_message = f"Docker build failed for {addon_image_tag} (exit code {result.exit_code}). Build output:\n{logs}"
+                raise docker.errors.DockerException(error_message)
+
+            return addon_image_tag, logs
+
         try:
-            image, log = await self.sys_run_in_executor(
-                self.sys_docker.images.build,
-                use_config_proxy=False,
-                **build_env.get_docker_args(version, image),
-            )
+            addon_image_tag, log = await self.sys_run_in_executor(build_image)
 
             _LOGGER.debug("Build %s:%s done: %s", self.image, version, log)
 
             # Update meta data
-            self._meta = image.attrs
+            self._meta = await self.sys_docker.images.inspect(addon_image_tag)
 
-        except (docker.errors.DockerException, requests.RequestException) as err:
-            _LOGGER.error("Can't build %s:%s: %s", self.image, version, err)
-            if hasattr(err, "build_log"):
-                log = "\n".join(
-                    [
-                        x["stream"]
-                        for x in err.build_log  # pylint: disable=no-member
-                        if isinstance(x, dict) and "stream" in x
-                    ]
-                )
-                _LOGGER.error("Build log: \n%s", log)
-            raise DockerError() from err
+        except (
+            docker.errors.DockerException,
+            requests.RequestException,
+            aiodocker.DockerError,
+        ) as err:
+            raise DockerBuildError(
+                f"Can't build {self.image}:{version}: {err!s}", _LOGGER.error
+            ) from err
 
         _LOGGER.info("Build %s:%s done", self.image, version)
 
-    @Job(
-        name="docker_addon_export_image",
-        limit=JobExecutionLimit.GROUP_ONCE,
-        on_condition=DockerJobError,
-    )
-    def export_image(self, tar_file: Path) -> Awaitable[None]:
-        """Export current images into a tar file."""
-        return self.sys_run_in_executor(
-            self.sys_docker.export_image, self.image, self.version, tar_file
-        )
+    def export_image(self, tar_file: Path) -> None:
+        """Export current images into a tar file.
+
+        Must be run in executor.
+        """
+        if not self.image:
+            raise RuntimeError("Cannot export without image!")
+        self.sys_docker.export_image(self.image, self.version, tar_file)
 
     @Job(
         name="docker_addon_import_image",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def import_image(self, tar_file: Path) -> None:
         """Import a tar file as image."""
-        docker_image = await self.sys_run_in_executor(
-            self.sys_docker.import_image, tar_file
-        )
-        if docker_image:
-            self._meta = docker_image.attrs
+        if docker_image := await self.sys_docker.import_image(tar_file):
+            self._meta = docker_image
             _LOGGER.info("Importing image %s and version %s", tar_file, self.version)
 
             with suppress(DockerError):
                 await self.cleanup()
 
-    @Job(name="docker_addon_cleanup", limit=JobExecutionLimit.GROUP_WAIT)
+    @Job(name="docker_addon_cleanup", concurrency=JobConcurrency.GROUP_QUEUE)
     async def cleanup(
         self,
         old_image: str | None = None,
@@ -717,31 +803,32 @@ class DockerAddon(DockerInterface):
         version: AwesomeVersion | None = None,
     ) -> None:
         """Check if old version exists and cleanup other versions of image not in use."""
-        await self.sys_run_in_executor(
-            self.sys_docker.cleanup_old_images,
-            (image := image or self.image),
-            version or self.version,
+        if not (use_image := image or self.image):
+            raise DockerError("Cannot determine image from metadata!", _LOGGER.error)
+        if not (use_version := version or self.version):
+            raise DockerError("Cannot determine version from metadata!", _LOGGER.error)
+
+        await self.sys_docker.cleanup_old_images(
+            use_image,
+            use_version,
             {old_image} if old_image else None,
             keep_images={
                 f"{addon.image}:{addon.version}"
                 for addon in self.sys_addons.installed
                 if addon.slug != self.addon.slug
                 and addon.image
-                and addon.image in {old_image, image}
+                and addon.image in {old_image, use_image}
             },
         )
 
     @Job(
         name="docker_addon_write_stdin",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
-    async def write_stdin(self, data: bytes) -> None:
+    def write_stdin(self, data: bytes) -> Awaitable[None]:
         """Write to add-on stdin."""
-        if not await self.is_running():
-            raise DockerError()
-
-        await self.sys_run_in_executor(self._write_stdin, data)
+        return self.sys_run_in_executor(self._write_stdin, data)
 
     def _write_stdin(self, data: bytes) -> None:
         """Write to add-on stdin.
@@ -750,8 +837,11 @@ class DockerAddon(DockerInterface):
         """
         try:
             # Load needed docker objects
-            container = self.sys_docker.containers.get(self.name)
-            socket = container.attach_socket(params={"stdin": 1, "stream": 1})
+            container = self.sys_docker.containers_legacy.get(self.name)
+            # attach_socket returns SocketIO for local Docker connections (Unix socket)
+            socket = cast(
+                SocketIO, container.attach_socket(params={"stdin": 1, "stream": 1})
+            )
         except (docker.errors.DockerException, requests.RequestException) as err:
             _LOGGER.error("Can't attach to %s stdin: %s", self.name, err)
             raise DockerError() from err
@@ -767,8 +857,8 @@ class DockerAddon(DockerInterface):
 
     @Job(
         name="docker_addon_stop",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def stop(self, remove_container: bool = True) -> None:
         """Stop/remove Docker container."""
@@ -778,7 +868,7 @@ class DockerAddon(DockerInterface):
                 await self.sys_plugins.dns.delete_host(self.addon.hostname)
             except CoreDNSError as err:
                 _LOGGER.warning("Can't update DNS for %s", self.name)
-                capture_exception(err)
+                await async_capture_exception(err)
 
         # Hardware
         if self._hw_listener:
@@ -787,21 +877,18 @@ class DockerAddon(DockerInterface):
 
         await super().stop(remove_container)
 
-    async def _validate_trust(
-        self, image_id: str, image: str, version: AwesomeVersion
-    ) -> None:
-        """Validate trust of content."""
-        if not self.addon.signed:
-            return
-
-        checksum = image_id.partition(":")[2]
-        return await self.sys_security.verify_content(self.addon.codenotary, checksum)
+        # If there is a device access issue and the container is removed, clear it
+        if (
+            remove_container
+            and self.addon.device_access_missing_issue in self.sys_resolution.issues
+        ):
+            self.sys_resolution.dismiss_issue(self.addon.device_access_missing_issue)
 
     @Job(
         name="docker_addon_hardware_events",
         conditions=[JobCondition.OS_AGENT],
-        limit=JobExecutionLimit.SINGLE_WAIT,
         internal=True,
+        concurrency=JobConcurrency.QUEUE,
     )
     async def _hardware_events(self, device: Device) -> None:
         """Process Hardware events for adjust device access."""
@@ -813,16 +900,27 @@ class DockerAddon(DockerInterface):
 
         try:
             docker_container = await self.sys_run_in_executor(
-                self.sys_docker.containers.get, self.name
+                self.sys_docker.containers_legacy.get, self.name
             )
         except docker.errors.NotFound:
-            self.sys_bus.remove_listener(self._hw_listener)
+            if self._hw_listener:
+                self.sys_bus.remove_listener(self._hw_listener)
             self._hw_listener = None
             return
         except (docker.errors.DockerException, requests.RequestException) as err:
             raise DockerError(
                 f"Can't process Hardware Event on {self.name}: {err!s}", _LOGGER.error
             ) from err
+
+        if (
+            self.sys_docker.info.cgroup == CGROUP_V2_VERSION
+            and not self.sys_os.available
+        ):
+            self.sys_resolution.add_issue(
+                evolve(self.addon.device_access_missing_issue),
+                suggestions=[SuggestionType.EXECUTE_RESTART],
+            )
+            return
 
         permission = self.sys_hardware.policy.get_cgroups_rule(device)
         try:

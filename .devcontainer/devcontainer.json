@@ -44,5 +44,8 @@
       }
     }
   },
-  "mounts": ["type=volume,target=/var/lib/docker"]
+  "mounts": [
+    "type=volume,target=/var/lib/docker",
+    "type=volume,target=/mnt/supervisor"
+  ]
 }

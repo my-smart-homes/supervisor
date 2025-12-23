@@ -1,11 +1,15 @@
 """Mock test."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from supervisor.backups.const import BackupType
+from supervisor.backups.backup import BackupLocation
+from supervisor.backups.const import LOCATION_CLOUD_BACKUP, LOCATION_TYPE, BackupType
 from supervisor.backups.validate import ALL_FOLDERS
+from supervisor.coresys import CoreSys
+from supervisor.mounts.mount import Mount
 
 from tests.const import TEST_ADDON_SLUG
 
@@ -37,7 +41,12 @@ def partial_backup_mock(backup_mock):
     backup_instance.sys_type = BackupType.PARTIAL
     backup_instance.folders = []
     backup_instance.addon_list = [TEST_ADDON_SLUG]
-    backup_instance.supervisor_version = "99.9.9dev"
+    backup_instance.supervisor_version = "9999.09.9.dev9999"
+    backup_instance.location = None
+    backup_instance.all_locations = {
+        None: BackupLocation(path=Path("/"), protected=False, size_bytes=0)
+    }
+    backup_instance.validate_backup = AsyncMock()
     yield backup_mock
 
 
@@ -48,5 +57,41 @@ def full_backup_mock(backup_mock):
     backup_instance.sys_type = BackupType.FULL
     backup_instance.folders = ALL_FOLDERS
     backup_instance.addon_list = [TEST_ADDON_SLUG]
-    backup_instance.supervisor_version = "99.9.9dev"
+    backup_instance.supervisor_version = "9999.09.9.dev9999"
+    backup_instance.location = None
+    backup_instance.all_locations = {
+        None: BackupLocation(path=Path("/"), protected=False, size_bytes=0)
+    }
+    backup_instance.validate_backup = AsyncMock()
     yield backup_mock
+
+
+@pytest.fixture(name="backup_locations")
+async def fixture_backup_locations(
+    request: pytest.FixtureRequest, coresys: CoreSys, mount_propagation, mock_is_mount
+) -> list[LOCATION_TYPE]:
+    """Return a list of prcoessed backup locations."""
+    locations: list[LOCATION_TYPE] = []
+    loaded = False
+    for location in request.param:
+        if location in {None, LOCATION_CLOUD_BACKUP}:
+            locations.append(location)
+        else:
+            if not loaded:
+                await coresys.mounts.load()
+
+            await coresys.mounts.create_mount(
+                Mount.from_dict(
+                    coresys,
+                    {
+                        "name": location,
+                        "usage": "backup",
+                        "type": "cifs",
+                        "server": "test.local",
+                        "share": "test",
+                    },
+                )
+            )
+            locations.append(coresys.mounts.get(location))
+
+    return locations

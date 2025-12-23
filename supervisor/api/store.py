@@ -1,12 +1,13 @@
 """Init file for Supervisor Home Assistant RESTful API."""
 
 import asyncio
-from collections.abc import Awaitable
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 from aiohttp import web
 import voluptuous as vol
 
+from ..addons.addon import Addon
 from ..addons.manager import AnyAddon
 from ..addons.utils import rating_security
 from ..api.const import ATTR_SIGNED
@@ -34,6 +35,7 @@ from ..const import (
     ATTR_ICON,
     ATTR_INGRESS,
     ATTR_INSTALLED,
+    ATTR_JOB_ID,
     ATTR_LOGO,
     ATTR_LONG_DESCRIPTION,
     ATTR_MAINTAINER,
@@ -51,15 +53,17 @@ from ..const import (
     REQUEST_FROM,
 )
 from ..coresys import CoreSysAttributes
-from ..exceptions import APIError, APIForbidden
+from ..exceptions import APIError, APIForbidden, APINotFound, StoreAddonNotFoundError
 from ..store.addon import AddonStore
 from ..store.repository import Repository
 from ..store.validate import validate_repository
-from .const import CONTENT_TYPE_PNG, CONTENT_TYPE_TEXT
+from .const import ATTR_BACKGROUND, CONTENT_TYPE_PNG, CONTENT_TYPE_TEXT
+from .utils import background_task
 
 SCHEMA_UPDATE = vol.Schema(
     {
         vol.Optional(ATTR_BACKUP): bool,
+        vol.Optional(ATTR_BACKGROUND, default=False): bool,
     }
 )
 
@@ -67,48 +71,70 @@ SCHEMA_ADD_REPOSITORY = vol.Schema(
     {vol.Required(ATTR_REPOSITORY): vol.All(str, validate_repository)}
 )
 
+SCHEMA_INSTALL = vol.Schema(
+    {
+        vol.Optional(ATTR_BACKGROUND, default=False): bool,
+    }
+)
+
+
+def _read_static_text_file(path: Path) -> Any:
+    """Read in a static text file asset for API output.
+
+    Must be run in executor.
+    """
+    with path.open("r", errors="replace") as asset:
+        return asset.read()
+
+
+def _read_static_binary_file(path: Path) -> Any:
+    """Read in a static binary file asset for API output.
+
+    Must be run in executor.
+    """
+    with path.open("rb") as asset:
+        return asset.read()
+
 
 class APIStore(CoreSysAttributes):
     """Handle RESTful API for store functions."""
 
     def _extract_addon(self, request: web.Request, installed=False) -> AnyAddon:
         """Return add-on, throw an exception it it doesn't exist."""
-        addon_slug: str = request.match_info.get("addon")
-        addon_version: str = request.match_info.get("version", "latest")
+        addon_slug: str = request.match_info["addon"]
 
-        if installed:
-            addon = self.sys_addons.local.get(addon_slug)
-            if addon is None or not addon.is_installed:
-                raise APIError(f"Addon {addon_slug} is not installed")
-        else:
-            addon = self.sys_addons.store.get(addon_slug)
+        if not (addon := self.sys_addons.get(addon_slug)):
+            raise StoreAddonNotFoundError(addon=addon_slug)
 
-        if not addon:
-            raise APIError(
-                f"Addon {addon_slug} with version {addon_version} does not exist in the store"
-            )
+        if installed and not addon.is_installed:
+            raise APIError(f"Addon {addon_slug} is not installed")
+
+        if not installed and addon.is_installed:
+            addon = cast(Addon, addon)
+            if not addon.addon_store:
+                raise StoreAddonNotFoundError(addon=addon_slug)
+            return addon.addon_store
 
         return addon
 
     def _extract_repository(self, request: web.Request) -> Repository:
         """Return repository, throw an exception it it doesn't exist."""
-        repository_slug: str = request.match_info.get("repository")
+        repository_slug: str = request.match_info["repository"]
 
-        repository = self.sys_store.get(repository_slug)
-        if not repository:
-            raise APIError(f"Repository {repository_slug} does not exist in the store")
+        if repository_slug not in self.sys_store.repositories:
+            raise APINotFound(
+                f"Repository {repository_slug} does not exist in the store"
+            )
 
-        return repository
+        return self.sys_store.get(repository_slug)
 
-    def _generate_addon_information(
+    async def _generate_addon_information(
         self, addon: AddonStore, extended: bool = False
     ) -> dict[str, Any]:
         """Generate addon information."""
 
         installed = (
-            self.sys_addons.get(addon.slug, local_only=True)
-            if addon.is_installed
-            else None
+            self.sys_addons.get_local_only(addon.slug) if addon.is_installed else None
         )
 
         data = {
@@ -126,12 +152,10 @@ class APIStore(CoreSysAttributes):
             ATTR_REPOSITORY: addon.repository,
             ATTR_SLUG: addon.slug,
             ATTR_STAGE: addon.stage,
-            ATTR_UPDATE_AVAILABLE: installed.need_update
-            if addon.is_installed
-            else False,
+            ATTR_UPDATE_AVAILABLE: installed.need_update if installed else False,
             ATTR_URL: addon.url,
             ATTR_VERSION_LATEST: addon.latest_version,
-            ATTR_VERSION: installed.version if addon.is_installed else None,
+            ATTR_VERSION: installed.version if installed else None,
         }
         if extended:
             data.update(
@@ -147,7 +171,7 @@ class APIStore(CoreSysAttributes):
                     ATTR_HOST_NETWORK: addon.host_network,
                     ATTR_HOST_PID: addon.host_pid,
                     ATTR_INGRESS: addon.with_ingress,
-                    ATTR_LONG_DESCRIPTION: addon.long_description,
+                    ATTR_LONG_DESCRIPTION: await addon.long_description(),
                     ATTR_RATING: rating_security(addon),
                     ATTR_SIGNED: addon.signed,
                 }
@@ -176,10 +200,12 @@ class APIStore(CoreSysAttributes):
     async def store_info(self, request: web.Request) -> dict[str, Any]:
         """Return store information."""
         return {
-            ATTR_ADDONS: [
-                self._generate_addon_information(self.sys_addons.store[addon])
-                for addon in self.sys_addons.store
-            ],
+            ATTR_ADDONS: await asyncio.gather(
+                *[
+                    self._generate_addon_information(self.sys_addons.store[addon])
+                    for addon in self.sys_addons.store
+                ]
+            ),
             ATTR_REPOSITORIES: [
                 self._generate_repository_information(repository)
                 for repository in self.sys_store.all
@@ -190,31 +216,54 @@ class APIStore(CoreSysAttributes):
     async def addons_list(self, request: web.Request) -> dict[str, Any]:
         """Return all store add-ons."""
         return {
-            ATTR_ADDONS: [
-                self._generate_addon_information(self.sys_addons.store[addon])
-                for addon in self.sys_addons.store
-            ]
+            ATTR_ADDONS: await asyncio.gather(
+                *[
+                    self._generate_addon_information(self.sys_addons.store[addon])
+                    for addon in self.sys_addons.store
+                ]
+            )
         }
 
     @api_process
-    def addons_addon_install(self, request: web.Request) -> Awaitable[None]:
+    async def addons_addon_install(self, request: web.Request) -> dict[str, str] | None:
         """Install add-on."""
         addon = self._extract_addon(request)
-        return asyncio.shield(self.sys_addons.install(addon.slug))
+        body = await api_validate(SCHEMA_INSTALL, request)
+
+        background = body[ATTR_BACKGROUND]
+
+        install_task, job_id = await background_task(
+            self, self.sys_addons.install, addon.slug
+        )
+
+        if background and not install_task.done():
+            return {ATTR_JOB_ID: job_id}
+
+        return await install_task
 
     @api_process
-    async def addons_addon_update(self, request: web.Request) -> None:
+    async def addons_addon_update(self, request: web.Request) -> dict[str, str] | None:
         """Update add-on."""
         addon = self._extract_addon(request, installed=True)
         if addon == request.get(REQUEST_FROM):
             raise APIForbidden(f"Add-on {addon.slug} can't update itself!")
 
         body = await api_validate(SCHEMA_UPDATE, request)
+        background = body[ATTR_BACKGROUND]
 
-        if start_task := await asyncio.shield(
-            self.sys_addons.update(addon.slug, backup=body.get(ATTR_BACKUP))
-        ):
+        update_task, job_id = await background_task(
+            self,
+            self.sys_addons.update,
+            addon.slug,
+            backup=body.get(ATTR_BACKUP),
+        )
+
+        if background and not update_task.done():
+            return {ATTR_JOB_ID: job_id}
+
+        if start_task := await update_task:
             await start_task
+        return None
 
     @api_process
     async def addons_addon_info(self, request: web.Request) -> dict[str, Any]:
@@ -224,8 +273,8 @@ class APIStore(CoreSysAttributes):
     # Used by legacy routing for addons/{addon}/info, can be refactored out when that is removed (1/2023)
     async def addons_addon_info_wrapped(self, request: web.Request) -> dict[str, Any]:
         """Return add-on information directly (not api)."""
-        addon: AddonStore = self._extract_addon(request)
-        return self._generate_addon_information(addon, True)
+        addon = cast(AddonStore, self._extract_addon(request))
+        return await self._generate_addon_information(addon, True)
 
     @api_process_raw(CONTENT_TYPE_PNG)
     async def addons_addon_icon(self, request: web.Request) -> bytes:
@@ -234,8 +283,7 @@ class APIStore(CoreSysAttributes):
         if not addon.with_icon:
             raise APIError(f"No icon found for add-on {addon.slug}!")
 
-        with addon.path_icon.open("rb") as png:
-            return png.read()
+        return await self.sys_run_in_executor(_read_static_binary_file, addon.path_icon)
 
     @api_process_raw(CONTENT_TYPE_PNG)
     async def addons_addon_logo(self, request: web.Request) -> bytes:
@@ -244,8 +292,7 @@ class APIStore(CoreSysAttributes):
         if not addon.with_logo:
             raise APIError(f"No logo found for add-on {addon.slug}!")
 
-        with addon.path_logo.open("rb") as png:
-            return png.read()
+        return await self.sys_run_in_executor(_read_static_binary_file, addon.path_logo)
 
     @api_process_raw(CONTENT_TYPE_TEXT)
     async def addons_addon_changelog(self, request: web.Request) -> str:
@@ -259,8 +306,9 @@ class APIStore(CoreSysAttributes):
         if not addon.with_changelog:
             return f"No changelog found for add-on {addon.slug}!"
 
-        with addon.path_changelog.open("r") as changelog:
-            return changelog.read()
+        return await self.sys_run_in_executor(
+            _read_static_text_file, addon.path_changelog
+        )
 
     @api_process_raw(CONTENT_TYPE_TEXT)
     async def addons_addon_documentation(self, request: web.Request) -> str:
@@ -274,8 +322,15 @@ class APIStore(CoreSysAttributes):
         if not addon.with_documentation:
             return f"No documentation found for add-on {addon.slug}!"
 
-        with addon.path_documentation.open("r") as documentation:
-            return documentation.read()
+        return await self.sys_run_in_executor(
+            _read_static_text_file, addon.path_documentation
+        )
+
+    @api_process
+    async def addons_addon_availability(self, request: web.Request) -> None:
+        """Check add-on availability for current system."""
+        addon = cast(AddonStore, self._extract_addon(request))
+        addon.validate_availability()
 
     @api_process
     async def repositories_list(self, request: web.Request) -> list[dict[str, Any]]:
@@ -294,13 +349,13 @@ class APIStore(CoreSysAttributes):
         return self._generate_repository_information(repository)
 
     @api_process
-    async def add_repository(self, request: web.Request):
+    async def add_repository(self, request: web.Request) -> None:
         """Add repository to the store."""
         body = await api_validate(SCHEMA_ADD_REPOSITORY, request)
         await asyncio.shield(self.sys_store.add_repository(body[ATTR_REPOSITORY]))
 
     @api_process
-    async def remove_repository(self, request: web.Request):
+    async def remove_repository(self, request: web.Request) -> None:
         """Remove repository from the store."""
         repository: Repository = self._extract_repository(request)
         await asyncio.shield(self.sys_store.remove_repository(repository))

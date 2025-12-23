@@ -1,6 +1,7 @@
 """Board management for OS Agent."""
 
 import logging
+from typing import cast
 
 from dbus_fast.aio.message_bus import MessageBus
 
@@ -47,7 +48,7 @@ class BoardManager(DBusInterfaceProxy):
         if self.board != BOARD_NAME_GREEN:
             raise BoardInvalidError("Green board is not in use", _LOGGER.error)
 
-        return self._board_proxy
+        return cast(Green, self._board_proxy)
 
     @property
     def supervised(self) -> Supervised:
@@ -55,7 +56,7 @@ class BoardManager(DBusInterfaceProxy):
         if self.board != BOARD_NAME_SUPERVISED:
             raise BoardInvalidError("Supervised board is not in use", _LOGGER.error)
 
-        return self._board_proxy
+        return cast(Supervised, self._board_proxy)
 
     @property
     def yellow(self) -> Yellow:
@@ -63,18 +64,18 @@ class BoardManager(DBusInterfaceProxy):
         if self.board != BOARD_NAME_YELLOW:
             raise BoardInvalidError("Yellow board is not in use", _LOGGER.error)
 
-        return self._board_proxy
+        return cast(Yellow, self._board_proxy)
 
     async def connect(self, bus: MessageBus) -> None:
         """Connect to D-Bus."""
         await super().connect(bus)
 
         if self.board == BOARD_NAME_YELLOW:
-            self._board_proxy = Yellow()
+            self._board_proxy = await Yellow().load_config()
         elif self.board == BOARD_NAME_GREEN:
-            self._board_proxy = Green()
+            self._board_proxy = await Green().load_config()
         elif self.board == BOARD_NAME_SUPERVISED:
-            self._board_proxy = Supervised()
+            self._board_proxy = await Supervised().load_config()
         else:
             return
 

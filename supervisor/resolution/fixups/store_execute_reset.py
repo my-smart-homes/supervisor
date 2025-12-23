@@ -11,7 +11,6 @@ from ...exceptions import (
 )
 from ...jobs.const import JobCondition
 from ...jobs.decorator import Job
-from ...utils import remove_folder
 from ..const import ContextType, IssueType, SuggestionType
 from .base import FixupBase
 
@@ -33,6 +32,9 @@ class FixupStoreExecuteReset(FixupBase):
     )
     async def process_fixup(self, reference: str | None = None) -> None:
         """Initialize the fixup class."""
+        if not reference:
+            return
+
         _LOGGER.info("Reset corrupt Store: %s", reference)
         try:
             repository = self.sys_store.get(reference)
@@ -40,11 +42,8 @@ class FixupStoreExecuteReset(FixupBase):
             _LOGGER.warning("Can't find store %s for fixup", reference)
             return
 
-        await remove_folder(repository.git.path)
-
-        # Load data again
         try:
-            await repository.load()
+            await repository.reset()
         except StoreError:
             raise ResolutionFixupError() from None
 

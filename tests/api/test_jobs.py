@@ -4,8 +4,10 @@ import asyncio
 from unittest.mock import ANY
 
 from aiohttp.test_utils import TestClient
+import pytest
 
 from supervisor.coresys import CoreSys
+from supervisor.exceptions import SupervisorError
 from supervisor.jobs.const import ATTR_IGNORE_CONDITIONS, JobCondition
 from supervisor.jobs.decorator import Job
 
@@ -101,27 +103,7 @@ async def test_jobs_tree_representation(api_client: TestClient, coresys: CoreSys
     result = await resp.json()
     assert result["data"]["jobs"] == [
         {
-            "name": "test_jobs_tree_outer",
-            "reference": None,
-            "uuid": ANY,
-            "progress": 50,
-            "stage": None,
-            "done": False,
-            "errors": [],
-            "child_jobs": [
-                {
-                    "name": "test_jobs_tree_inner",
-                    "reference": None,
-                    "uuid": ANY,
-                    "progress": 0,
-                    "stage": None,
-                    "done": False,
-                    "child_jobs": [],
-                    "errors": [],
-                },
-            ],
-        },
-        {
+            "created": ANY,
             "name": "test_jobs_tree_alt",
             "reference": None,
             "uuid": ANY,
@@ -130,6 +112,32 @@ async def test_jobs_tree_representation(api_client: TestClient, coresys: CoreSys
             "done": False,
             "child_jobs": [],
             "errors": [],
+            "extra": None,
+        },
+        {
+            "created": ANY,
+            "name": "test_jobs_tree_outer",
+            "reference": None,
+            "uuid": ANY,
+            "progress": 50,
+            "stage": None,
+            "done": False,
+            "errors": [],
+            "extra": None,
+            "child_jobs": [
+                {
+                    "created": ANY,
+                    "name": "test_jobs_tree_inner",
+                    "reference": None,
+                    "uuid": ANY,
+                    "progress": 0,
+                    "stage": None,
+                    "done": False,
+                    "child_jobs": [],
+                    "errors": [],
+                    "extra": None,
+                },
+            ],
         },
     ]
 
@@ -140,14 +148,16 @@ async def test_jobs_tree_representation(api_client: TestClient, coresys: CoreSys
     result = await resp.json()
     assert result["data"]["jobs"] == [
         {
+            "created": ANY,
             "name": "test_jobs_tree_alt",
             "reference": None,
             "uuid": ANY,
-            "progress": 0,
+            "progress": 100,
             "stage": "end",
             "done": True,
             "child_jobs": [],
             "errors": [],
+            "extra": None,
         },
     ]
     await outer_task
@@ -181,6 +191,7 @@ async def test_job_manual_cleanup(api_client: TestClient, coresys: CoreSys):
     assert resp.status == 200
     result = await resp.json()
     assert result["data"] == {
+        "created": ANY,
         "name": "test_job_manual_cleanup",
         "reference": None,
         "uuid": test.job_id,
@@ -189,6 +200,7 @@ async def test_job_manual_cleanup(api_client: TestClient, coresys: CoreSys):
         "done": False,
         "child_jobs": [],
         "errors": [],
+        "extra": None,
     }
 
     # Only done jobs can be deleted via API
@@ -213,6 +225,180 @@ async def test_job_manual_cleanup(api_client: TestClient, coresys: CoreSys):
 
     # Confirm it no longer exists
     resp = await api_client.get(f"/jobs/{test.job_id}")
-    assert resp.status == 400
+    assert resp.status == 404
     result = await resp.json()
-    assert result["message"] == f"No job found with id {test.job_id}"
+    assert result["message"] == "Job does not exist"
+
+
+@pytest.mark.parametrize(
+    ("method", "url"),
+    [("get", "/jobs/bad"), ("delete", "/jobs/bad")],
+)
+async def test_job_not_found(api_client: TestClient, method: str, url: str):
+    """Test job not found error."""
+    resp = await api_client.request(method, url)
+    assert resp.status == 404
+    body = await resp.json()
+    assert body["message"] == "Job does not exist"
+
+
+async def test_jobs_sorted(api_client: TestClient, coresys: CoreSys):
+    """Test jobs are sorted by datetime in results."""
+
+    class TestClass:
+        """Test class."""
+
+        def __init__(self, coresys: CoreSys):
+            """Initialize the test class."""
+            self.coresys = coresys
+
+        @Job(name="test_jobs_sorted_1", cleanup=False)
+        async def test_jobs_sorted_1(self):
+            """Sorted test method 1."""
+            await self.test_jobs_sorted_inner_1()
+            await self.test_jobs_sorted_inner_2()
+
+        @Job(name="test_jobs_sorted_inner_1", cleanup=False)
+        async def test_jobs_sorted_inner_1(self):
+            """Sorted test inner method 1."""
+
+        @Job(name="test_jobs_sorted_inner_2", cleanup=False)
+        async def test_jobs_sorted_inner_2(self):
+            """Sorted test inner method 2."""
+
+        @Job(name="test_jobs_sorted_2", cleanup=False)
+        async def test_jobs_sorted_2(self):
+            """Sorted test method 2."""
+
+    test = TestClass(coresys)
+    await test.test_jobs_sorted_1()
+    await test.test_jobs_sorted_2()
+
+    resp = await api_client.get("/jobs/info")
+    result = await resp.json()
+    assert result["data"]["jobs"] == [
+        {
+            "created": ANY,
+            "name": "test_jobs_sorted_2",
+            "reference": None,
+            "uuid": ANY,
+            "progress": 100,
+            "stage": None,
+            "done": True,
+            "errors": [],
+            "child_jobs": [],
+            "extra": None,
+        },
+        {
+            "created": ANY,
+            "name": "test_jobs_sorted_1",
+            "reference": None,
+            "uuid": ANY,
+            "progress": 100,
+            "stage": None,
+            "done": True,
+            "errors": [],
+            "extra": None,
+            "child_jobs": [
+                {
+                    "created": ANY,
+                    "name": "test_jobs_sorted_inner_1",
+                    "reference": None,
+                    "uuid": ANY,
+                    "progress": 100,
+                    "stage": None,
+                    "done": True,
+                    "errors": [],
+                    "child_jobs": [],
+                    "extra": None,
+                },
+                {
+                    "created": ANY,
+                    "name": "test_jobs_sorted_inner_2",
+                    "reference": None,
+                    "uuid": ANY,
+                    "progress": 100,
+                    "stage": None,
+                    "done": True,
+                    "errors": [],
+                    "child_jobs": [],
+                    "extra": None,
+                },
+            ],
+        },
+    ]
+
+
+async def test_job_with_error(
+    api_client: TestClient,
+    coresys: CoreSys,
+):
+    """Test job output with an error."""
+
+    class TestClass:
+        """Test class."""
+
+        def __init__(self, coresys: CoreSys):
+            """Initialize the test class."""
+            self.coresys = coresys
+
+        @Job(name="test_jobs_api_error_outer", cleanup=False)
+        async def test_jobs_api_error_outer(self):
+            """Error test outer method."""
+            coresys.jobs.current.stage = "test"
+            await self.test_jobs_api_error_inner()
+
+        @Job(name="test_jobs_api_error_inner", cleanup=False)
+        async def test_jobs_api_error_inner(self):
+            """Error test inner method."""
+            raise SupervisorError("bad")
+
+    test = TestClass(coresys)
+    with pytest.raises(SupervisorError):
+        await test.test_jobs_api_error_outer()
+
+    resp = await api_client.get("/jobs/info")
+    result = await resp.json()
+    assert result["data"]["jobs"] == [
+        {
+            "created": ANY,
+            "name": "test_jobs_api_error_outer",
+            "reference": None,
+            "uuid": ANY,
+            "progress": 0,
+            "stage": "test",
+            "done": True,
+            "extra": None,
+            "errors": [
+                {
+                    "type": "SupervisorError",
+                    "message": "bad",
+                    "stage": "test",
+                    "error_key": None,
+                    "extra_fields": None,
+                }
+            ],
+            "child_jobs": [
+                {
+                    "created": ANY,
+                    "name": "test_jobs_api_error_inner",
+                    "reference": None,
+                    "uuid": ANY,
+                    "progress": 0,
+                    "stage": None,
+                    "done": True,
+                    "extra": None,
+                    "errors": [
+                        {
+                            "type": "SupervisorError",
+                            "message": "bad",
+                            "stage": None,
+                            "error_key": None,
+                            "extra_fields": None,
+                        }
+                    ],
+                    "child_jobs": [],
+                },
+            ],
+        },
+    ]

@@ -13,25 +13,29 @@ import aiohttp
 from aiohttp.client_exceptions import ClientError
 from awesomeversion import AwesomeVersion, AwesomeVersionException
 
-from .const import ATTR_SUPERVISOR_INTERNET, SUPERVISOR_VERSION, URL_HASSIO_APPARMOR
+from supervisor.jobs import ChildJobSyncFilter
+
+from .const import (
+    ATTR_SUPERVISOR_INTERNET,
+    SUPERVISOR_VERSION,
+    URL_HASSIO_APPARMOR,
+    BusEvent,
+)
 from .coresys import CoreSys, CoreSysAttributes
 from .docker.stats import DockerStats
 from .docker.supervisor import DockerSupervisor
 from .exceptions import (
-    CodeNotaryError,
-    CodeNotaryUntrusted,
     DockerError,
     HostAppArmorError,
     SupervisorAppArmorError,
-    SupervisorError,
     SupervisorJobError,
+    SupervisorUnknownError,
     SupervisorUpdateError,
 )
-from .jobs.const import JobCondition, JobExecutionLimit
+from .jobs.const import JobCondition, JobThrottle
 from .jobs.decorator import Job
 from .resolution.const import ContextType, IssueType, UnhealthyReason
-from .utils.codenotary import calc_checksum
-from .utils.sentry import capture_exception
+from .utils.sentry import async_capture_exception
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -41,7 +45,7 @@ def _check_connectivity_throttle_period(coresys: CoreSys, *_) -> timedelta:
     if coresys.supervisor.connectivity:
         return timedelta(minutes=10)
 
-    return timedelta()
+    return timedelta(seconds=5)
 
 
 class Supervisor(CoreSysAttributes):
@@ -74,6 +78,7 @@ class Supervisor(CoreSysAttributes):
         if self._connectivity == state:
             return
         self._connectivity = state
+        self.sys_bus.fire_event(BusEvent.SUPERVISOR_CONNECTIVITY_CHANGE, state)
         self.sys_homeassistant.websocket.supervisor_update_event(
             "network", {ATTR_SUPERVISOR_INTERNET: state}
         )
@@ -100,17 +105,22 @@ class Supervisor(CoreSysAttributes):
         return AwesomeVersion(SUPERVISOR_VERSION)
 
     @property
-    def latest_version(self) -> AwesomeVersion:
-        """Return last available version of Home Assistant."""
+    def latest_version(self) -> AwesomeVersion | None:
+        """Return last available version of ."""
         return self.sys_updater.version_supervisor
 
     @property
-    def image(self) -> str:
-        """Return image name of Home Assistant container."""
+    def default_image(self) -> str:
+        """Return the default image for this system."""
+        return f"ghcr.io/home-assistant/{self.sys_arch.supervisor}-hassio-supervisor"
+
+    @property
+    def image(self) -> str | None:
+        """Return image name of Supervisor container."""
         return self.instance.image
 
     @property
-    def arch(self) -> str:
+    def arch(self) -> str | None:
         """Return arch of the Supervisor container."""
         return self.instance.arch
 
@@ -137,48 +147,61 @@ class Supervisor(CoreSysAttributes):
                 _LOGGER.error,
             ) from err
 
-        # Validate
-        try:
-            await self.sys_security.verify_own_content(calc_checksum(data))
-        except CodeNotaryUntrusted as err:
-            raise SupervisorAppArmorError(
-                "Content-Trust is broken for the AppArmor profile fetch!",
-                _LOGGER.critical,
-            ) from err
-        except CodeNotaryError as err:
-            raise SupervisorAppArmorError(
-                f"CodeNotary error while processing AppArmor fetch: {err!s}",
-                _LOGGER.error,
-            ) from err
-
         # Load
-        with TemporaryDirectory(dir=self.sys_config.path_tmp) as tmp_dir:
-            profile_file = Path(tmp_dir, "apparmor.txt")
-            try:
-                profile_file.write_text(data, encoding="utf-8")
-            except OSError as err:
-                if err.errno == errno.EBADMSG:
-                    self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
-                raise SupervisorAppArmorError(
-                    f"Can't write temporary profile: {err!s}", _LOGGER.error
-                ) from err
+        temp_dir: TemporaryDirectory | None = None
 
-            try:
-                await self.sys_host.apparmor.load_profile(
-                    "hassio-supervisor", profile_file
+        def write_profile() -> Path:
+            nonlocal temp_dir
+            temp_dir = TemporaryDirectory(dir=self.sys_config.path_tmp)
+            profile_file = Path(temp_dir.name, "apparmor.txt")
+            profile_file.write_text(data, encoding="utf-8")
+            return profile_file
+
+        try:
+            profile_file = await self.sys_run_in_executor(write_profile)
+
+            await self.sys_host.apparmor.load_profile("hassio-supervisor", profile_file)
+
+        except OSError as err:
+            if err.errno == errno.EBADMSG:
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
                 )
-            except HostAppArmorError as err:
-                raise SupervisorAppArmorError(
-                    "Can't update AppArmor profile!", _LOGGER.error
-                ) from err
+            raise SupervisorAppArmorError(
+                f"Can't write temporary profile: {err!s}", _LOGGER.error
+            ) from err
 
+        except HostAppArmorError as err:
+            raise SupervisorAppArmorError(
+                "Can't update AppArmor profile!", _LOGGER.error
+            ) from err
+
+        finally:
+            if temp_dir:
+                await self.sys_run_in_executor(temp_dir.cleanup)
+
+    @Job(
+        name="supervisor_update",
+        # We assume for now the docker image pull is 100% of this task. But from
+        # a user perspective that isn't true.  Other steps that take time which
+        # is not accounted for in progress include: app armor update and restart
+        child_job_syncs=[
+            ChildJobSyncFilter("docker_interface_install", progress_allocation=1.0)
+        ],
+    )
     async def update(self, version: AwesomeVersion | None = None) -> None:
         """Update Supervisor version."""
-        version = version or self.latest_version
+        version = version or self.latest_version or self.version
 
-        if version == self.sys_supervisor.version:
+        if version == self.version:
             raise SupervisorUpdateError(
                 f"Version {version!s} is already installed", _LOGGER.warning
+            )
+
+        image = self.sys_updater.image_supervisor or self.instance.image
+        if not image:
+            raise SupervisorUpdateError(
+                "Cannot determine image to use for supervisor update!", _LOGGER.error
             )
 
         # First update own AppArmor
@@ -192,25 +215,22 @@ class Supervisor(CoreSysAttributes):
 
         # Update container
         _LOGGER.info("Update Supervisor to version %s", version)
+
         try:
-            await self.instance.install(
-                version, image=self.sys_updater.image_supervisor
-            )
-            await self.instance.update_start_tag(
-                self.sys_updater.image_supervisor, version
-            )
+            await self.instance.install(version, image=image)
+            await self.instance.update_start_tag(image, version)
         except DockerError as err:
             self.sys_resolution.create_issue(
                 IssueType.UPDATE_FAILED, ContextType.SUPERVISOR
             )
-            capture_exception(err)
+            await async_capture_exception(err)
             raise SupervisorUpdateError(
-                f"Update of Supervisor failed: {err!s}", _LOGGER.error
+                f"Update of Supervisor failed: {err!s}", _LOGGER.critical
             ) from err
 
         self.sys_config.version = version
-        self.sys_config.image = self.sys_updater.image_supervisor
-        self.sys_config.save_data()
+        self.sys_config.image = image
+        await self.sys_config.save_data()
 
         self.sys_create_task(self.sys_core.stop())
 
@@ -236,19 +256,12 @@ class Supervisor(CoreSysAttributes):
         """
         return self.instance.logs()
 
-    def check_trust(self) -> Awaitable[None]:
-        """Calculate Supervisor docker content trust.
-
-        Return Coroutine.
-        """
-        return self.instance.check_trust()
-
     async def stats(self) -> DockerStats:
         """Return stats of Supervisor."""
         try:
             return await self.instance.stats()
         except DockerError as err:
-            raise SupervisorError() from err
+            raise SupervisorUnknownError() from err
 
     async def repair(self):
         """Repair local Supervisor data."""
@@ -263,17 +276,19 @@ class Supervisor(CoreSysAttributes):
 
     @Job(
         name="supervisor_check_connectivity",
-        limit=JobExecutionLimit.THROTTLE,
         throttle_period=_check_connectivity_throttle_period,
+        throttle=JobThrottle.THROTTLE,
     )
-    async def check_connectivity(self):
-        """Check the connection."""
+    async def check_connectivity(self) -> None:
+        """Check the Internet connectivity from Supervisor's point of view."""
         timeout = aiohttp.ClientTimeout(total=10)
         try:
             await self.sys_websession.head(
                 "https://checkonline.home-assistant.io/online.txt", timeout=timeout
             )
-        except (ClientError, TimeoutError):
+        except (ClientError, TimeoutError) as err:
+            _LOGGER.debug("Supervisor Connectivity check failed: %s", err)
             self.connectivity = False
         else:
+            _LOGGER.debug("Supervisor Connectivity check succeeded")
             self.connectivity = True

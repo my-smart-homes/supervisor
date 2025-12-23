@@ -1,5 +1,9 @@
 """Init file for Supervisor network RESTful API."""
 
+from typing import Any
+
+from aiohttp import web
+
 from ..const import (
     ATTR_AVAILABLE,
     ATTR_PROVIDERS,
@@ -9,7 +13,7 @@ from ..const import (
     REQUEST_FROM,
 )
 from ..coresys import CoreSysAttributes
-from ..exceptions import APIError, APIForbidden
+from ..exceptions import APIError, APIForbidden, APINotFound
 from .utils import api_process, api_validate
 
 
@@ -20,12 +24,12 @@ class APIServices(CoreSysAttributes):
         """Return service, throw an exception if it doesn't exist."""
         service = self.sys_services.get(request.match_info.get("service"))
         if not service:
-            raise APIError("Service does not exist")
+            raise APINotFound("Service does not exist")
 
         return service
 
     @api_process
-    async def list(self, request):
+    async def list_services(self, request: web.Request) -> dict[str, Any]:
         """Show register services."""
         services = []
         for service in self.sys_services.list_services:
@@ -40,17 +44,17 @@ class APIServices(CoreSysAttributes):
         return {ATTR_SERVICES: services}
 
     @api_process
-    async def set_service(self, request):
+    async def set_service(self, request: web.Request) -> None:
         """Write data into a service."""
         service = self._extract_service(request)
         body = await api_validate(service.schema, request)
         addon = request[REQUEST_FROM]
 
         _check_access(request, service.slug)
-        service.set_service_data(addon, body)
+        await service.set_service_data(addon, body)
 
     @api_process
-    async def get_service(self, request):
+    async def get_service(self, request: web.Request) -> dict[str, Any]:
         """Read data into a service."""
         service = self._extract_service(request)
 
@@ -62,14 +66,14 @@ class APIServices(CoreSysAttributes):
         return service.get_service_data()
 
     @api_process
-    async def del_service(self, request):
+    async def del_service(self, request: web.Request) -> None:
         """Delete data into a service."""
         service = self._extract_service(request)
         addon = request[REQUEST_FROM]
 
         # Access
         _check_access(request, service.slug, True)
-        service.del_service_data(addon)
+        await service.del_service_data(addon)
 
 
 def _check_access(request, service, provide=False):

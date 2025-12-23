@@ -15,7 +15,7 @@ from supervisor.resolution.const import ContextType, IssueType
 async def fixture_dns_query() -> AsyncMock:
     """Mock aiodns query."""
     with patch(
-        "supervisor.resolution.checks.dns_server_ipv6.DNSResolver.query",
+        "supervisor.resolution.checks.dns_server.DNSResolver.query",
         new_callable=AsyncMock,
     ) as dns_query:
         yield dns_query
@@ -31,7 +31,7 @@ async def test_base(coresys: CoreSys):
 async def test_check(coresys: CoreSys, dns_query: AsyncMock, capture_exception: Mock):
     """Test check for DNS server IPv6 errors."""
     dns_server_ipv6 = CheckDNSServerIPv6(coresys)
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
 
     coresys.plugins.dns.servers = ["dns://1.1.1.1"]
     assert dns_server_ipv6.dns_servers == [
@@ -68,10 +68,10 @@ async def test_check(coresys: CoreSys, dns_query: AsyncMock, capture_exception: 
     capture_exception.assert_called_once_with(err)
 
 
-async def test_approve(coresys: CoreSys, dns_query: AsyncMock):
+async def test_approve(coresys: CoreSys, supervisor_internet, dns_query: AsyncMock):
     """Test approve existing DNS Server IPv6 error issues."""
     dns_server_ipv6 = CheckDNSServerIPv6(coresys)
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
 
     assert dns_server_ipv6.dns_servers == ["dns://192.168.30.1"]
     dns_query.side_effect = DNSError(4, "Domain name not found")
@@ -103,13 +103,13 @@ async def test_did_run(coresys: CoreSys):
 
     with patch.object(CheckDNSServerIPv6, "run_check", return_value=None) as check:
         for state in should_run:
-            coresys.core.state = state
+            await coresys.core.set_state(state)
             await dns_server_ipv6()
             check.assert_called_once()
             check.reset_mock()
 
         for state in should_not_run:
-            coresys.core.state = state
+            await coresys.core.set_state(state)
             await dns_server_ipv6()
             check.assert_not_called()
             check.reset_mock()
@@ -118,7 +118,7 @@ async def test_did_run(coresys: CoreSys):
 async def test_check_if_affected(coresys: CoreSys):
     """Test that check is still executed even if already affected."""
     dns_server_ipv6 = CheckDNSServerIPv6(coresys)
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
 
     coresys.resolution.create_issue(
         IssueType.DNS_SERVER_IPV6_ERROR,

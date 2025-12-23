@@ -13,7 +13,10 @@ from supervisor.resolution.checks.network_interface_ipv4 import (
 from supervisor.resolution.const import ContextType, IssueType
 from supervisor.resolution.data import Issue
 
-TEST_ISSUE = Issue(IssueType.IPV4_CONNECTION_PROBLEM, ContextType.SYSTEM, "eth0")
+TEST_ISSUES = {
+    Issue(IssueType.IPV4_CONNECTION_PROBLEM, ContextType.SYSTEM, "eth0"),
+    Issue(IssueType.IPV4_CONNECTION_PROBLEM, ContextType.SYSTEM, "eth0.10"),
+}
 
 
 async def test_base(coresys: CoreSys):
@@ -26,17 +29,17 @@ async def test_base(coresys: CoreSys):
 @pytest.mark.parametrize(
     "state_flags,issues",
     [
-        ({ConnectionStateFlags.IP4_READY}, []),
-        ({ConnectionStateFlags.IP6_READY}, [TEST_ISSUE]),
-        ({ConnectionStateFlags.NONE}, [TEST_ISSUE]),
+        ({ConnectionStateFlags.IP4_READY}, set()),
+        ({ConnectionStateFlags.IP6_READY}, TEST_ISSUES),
+        ({ConnectionStateFlags.NONE}, TEST_ISSUES),
     ],
 )
 async def test_check(
-    coresys: CoreSys, state_flags: set[ConnectionStateFlags], issues: list[Issue]
+    coresys: CoreSys, state_flags: set[ConnectionStateFlags], issues: set[Issue]
 ):
     """Test check."""
     network_interface = CheckNetworkInterfaceIPV4(coresys)
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
 
     assert len(coresys.resolution.issues) == 0
 
@@ -49,7 +52,7 @@ async def test_check(
     ):
         await network_interface.run_check()
 
-    assert coresys.resolution.issues == issues
+    assert set(coresys.resolution.issues) == issues
 
 
 @pytest.mark.parametrize(
@@ -65,7 +68,7 @@ async def test_approve(
 ):
     """Test check."""
     network_interface = CheckNetworkInterfaceIPV4(coresys)
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
 
     assert not await network_interface.approve_check("eth0")
 
@@ -89,13 +92,13 @@ async def test_did_run(coresys: CoreSys):
         return_value=None,
     ) as check:
         for state in should_run:
-            coresys.core.state = state
+            await coresys.core.set_state(state)
             await network_interface()
             check.assert_called_once()
             check.reset_mock()
 
         for state in should_not_run:
-            coresys.core.state = state
+            await coresys.core.set_state(state)
             await network_interface()
             check.assert_not_called()
             check.reset_mock()

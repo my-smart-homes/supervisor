@@ -16,10 +16,11 @@ from ..exceptions import (
     MulticastError,
     MulticastJobError,
     MulticastUpdateError,
+    PluginError,
 )
-from ..jobs.const import JobExecutionLimit
+from ..jobs.const import JobThrottle
 from ..jobs.decorator import Job
-from ..utils.sentry import capture_exception
+from ..utils.sentry import async_capture_exception
 from .base import PluginBase
 from .const import (
     FILE_HASSIO_MULTICAST,
@@ -63,7 +64,7 @@ class PluginMulticast(PluginBase):
         """Update Multicast plugin."""
         try:
             await super().update(version)
-        except DockerError as err:
+        except (DockerError, PluginError) as err:
             raise MulticastUpdateError(
                 "Multicast update failed", _LOGGER.error
             ) from err
@@ -109,14 +110,14 @@ class PluginMulticast(PluginBase):
             await self.instance.install(self.version)
         except DockerError as err:
             _LOGGER.error("Repair of Multicast failed")
-            capture_exception(err)
+            await async_capture_exception(err)
 
     @Job(
         name="plugin_multicast_restart_after_problem",
-        limit=JobExecutionLimit.THROTTLE_RATE_LIMIT,
         throttle_period=WATCHDOG_THROTTLE_PERIOD,
         throttle_max_calls=WATCHDOG_THROTTLE_MAX_CALLS,
         on_condition=MulticastJobError,
+        throttle=JobThrottle.RATE_LIMIT,
     )
     async def _restart_after_problem(self, state: ContainerState):
         """Restart unhealthy or failed plugin."""

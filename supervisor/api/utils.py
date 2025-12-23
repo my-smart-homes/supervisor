@@ -1,7 +1,9 @@
 """Init file for Supervisor util for RESTful API."""
 
+import asyncio
+from collections.abc import Callable, Mapping
 import json
-from typing import Any
+from typing import Any, cast
 
 from aiohttp import web
 from aiohttp.hdrs import AUTHORIZATION
@@ -14,6 +16,8 @@ from ..const import (
     HEADER_TOKEN,
     HEADER_TOKEN_OLD,
     JSON_DATA,
+    JSON_ERROR_KEY,
+    JSON_EXTRA_FIELDS,
     JSON_JOB_ID,
     JSON_MESSAGE,
     JSON_RESULT,
@@ -21,15 +25,16 @@ from ..const import (
     RESULT_ERROR,
     RESULT_OK,
 )
-from ..coresys import CoreSys
-from ..exceptions import APIError, APIForbidden, DockerAPIError, HassioError
+from ..coresys import CoreSys, CoreSysAttributes
+from ..exceptions import APIError, DockerAPIError, HassioError
+from ..jobs import JobSchedulerOptions, SupervisorJob
 from ..utils import check_exception_chain, get_message_from_exception_chain
 from ..utils.json import json_dumps, json_loads as json_loads_util
 from ..utils.log_format import format_message
 from . import const
 
 
-def excract_supervisor_token(request: web.Request) -> str | None:
+def extract_supervisor_token(request: web.Request) -> str | None:
     """Extract Supervisor token from request."""
     if supervisor_token := request.headers.get(HEADER_TOKEN):
         return supervisor_token
@@ -58,12 +63,16 @@ def json_loads(data: Any) -> dict[str, Any]:
 def api_process(method):
     """Wrap function with true/false calls to rest api."""
 
-    async def wrap_api(api, *args, **kwargs):
+    async def wrap_api(*args, **kwargs) -> web.Response | web.StreamResponse:
         """Return API information."""
         try:
-            answer = await method(api, *args, **kwargs)
-        except (APIError, APIForbidden, HassioError) as err:
-            return api_return_error(error=err)
+            answer = await method(*args, **kwargs)
+        except APIError as err:
+            return api_return_error(
+                err, status=err.status, job_id=err.job_id, headers=err.headers
+            )
+        except HassioError as err:
+            return api_return_error(err)
 
         if isinstance(answer, (dict, list)):
             return api_return_ok(data=answer)
@@ -81,7 +90,7 @@ def api_process(method):
 def require_home_assistant(method):
     """Ensure that the request comes from Home Assistant."""
 
-    async def wrap_api(api, *args, **kwargs):
+    async def wrap_api(api: CoreSysAttributes, *args, **kwargs) -> Any:
         """Return API information."""
         coresys: CoreSys = api.coresys
         request: Request = args[0]
@@ -98,10 +107,17 @@ def api_process_raw(content, *, error_type=None):
     def wrap_method(method):
         """Wrap function with raw output to rest api."""
 
-        async def wrap_api(api, *args, **kwargs):
+        async def wrap_api(*args, **kwargs) -> web.Response | web.StreamResponse:
             """Return api information."""
             try:
-                msg_data = await method(api, *args, **kwargs)
+                msg_data = await method(*args, **kwargs)
+            except APIError as err:
+                return api_return_error(
+                    err,
+                    error_type=error_type or const.CONTENT_TYPE_BINARY,
+                    status=err.status,
+                    job_id=err.job_id,
+                )
             except HassioError as err:
                 return api_return_error(
                     err, error_type=error_type or const.CONTENT_TYPE_BINARY
@@ -118,9 +134,13 @@ def api_process_raw(content, *, error_type=None):
 
 
 def api_return_error(
-    error: Exception | None = None,
+    error: HassioError | None = None,
     message: str | None = None,
     error_type: str | None = None,
+    status: int = 400,
+    *,
+    headers: Mapping[str, str] | None = None,
+    job_id: str | None = None,
 ) -> web.Response:
     """Return an API error message."""
     if error and not message:
@@ -128,35 +148,41 @@ def api_return_error(
         if check_exception_chain(error, DockerAPIError):
             message = format_message(message)
     if not message:
-        message = "Unknown error, see supervisor"
-
-    status = 400
-    if is_api_error := isinstance(error, APIError):
-        status = error.status
+        message = "Unknown error, see Supervisor logs (check with 'ha supervisor logs')"
 
     match error_type:
         case const.CONTENT_TYPE_TEXT:
-            return web.Response(body=message, content_type=error_type, status=status)
+            return web.Response(
+                body=message, content_type=error_type, status=status, headers=headers
+            )
         case const.CONTENT_TYPE_BINARY:
             return web.Response(
-                body=message.encode(), content_type=error_type, status=status
+                body=message.encode(),
+                content_type=error_type,
+                status=status,
+                headers=headers,
             )
         case _:
-            result = {
+            result: dict[str, Any] = {
                 JSON_RESULT: RESULT_ERROR,
                 JSON_MESSAGE: message,
             }
-            if is_api_error and error.job_id:
-                result[JSON_JOB_ID] = error.job_id
+            if job_id:
+                result[JSON_JOB_ID] = job_id
+            if error and error.error_key:
+                result[JSON_ERROR_KEY] = error.error_key
+            if error and error.extra_fields:
+                result[JSON_EXTRA_FIELDS] = error.extra_fields
 
     return web.json_response(
         result,
         status=status,
         dumps=json_dumps,
+        headers=headers,
     )
 
 
-def api_return_ok(data: dict[str, Any] | None = None) -> web.Response:
+def api_return_ok(data: dict[str, Any] | list[Any] | None = None) -> web.Response:
     """Return an API ok answer."""
     return web.json_response(
         {JSON_RESULT: RESULT_OK, JSON_DATA: data or {}},
@@ -165,7 +191,8 @@ def api_return_ok(data: dict[str, Any] | None = None) -> web.Response:
 
 
 async def api_validate(
-    schema: vol.Schema, request: web.Request, origin: list[str] | None = None
+    schema: vol.Schema | vol.All,
+    request: web.Request,
 ) -> dict[str, Any]:
     """Validate request data with schema."""
     data: dict[str, Any] = await request.json(loads=json_loads)
@@ -174,12 +201,48 @@ async def api_validate(
     except vol.Invalid as ex:
         raise APIError(humanize_error(data, ex)) from None
 
-    if not origin:
-        return data_validated
-
-    for origin_value in origin:
-        if origin_value not in data_validated:
-            continue
-        data_validated[origin_value] = data[origin_value]
-
     return data_validated
+
+
+async def background_task(
+    coresys_obj: CoreSysAttributes,
+    task_method: Callable,
+    *args,
+    **kwargs,
+) -> tuple[asyncio.Task, str]:
+    """Start task in background and return task and job ID.
+
+    Args:
+        coresys_obj: Instance that accesses coresys data using CoreSysAttributes
+        task_method: The method to execute in the background. Must include a keyword arg 'validation_complete' of type asyncio.Event. Should set it after any initial validation has completed
+        *args: Arguments to pass to task_method
+        **kwargs: Keyword arguments to pass to task_method
+
+    Returns:
+        Tuple of (task, job_id)
+
+    """
+    event = asyncio.Event()
+    job, task = cast(
+        tuple[SupervisorJob, asyncio.Task],
+        coresys_obj.sys_jobs.schedule_job(
+            task_method,
+            JobSchedulerOptions(),
+            *args,
+            validation_complete=event,
+            **kwargs,
+        ),
+    )
+
+    # Wait for provided event before returning
+    # If the task fails validation it should raise before getting there
+    event_task = coresys_obj.sys_create_task(event.wait())
+    _, pending = await asyncio.wait(
+        (task, event_task),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    # It seems task returned early (error or something), make sure to cancel
+    # the event task to avoid "Task was destroyed but it is pending!" errors.
+    if event_task in pending:
+        event_task.cancel()
+    return (task, job.uuid)

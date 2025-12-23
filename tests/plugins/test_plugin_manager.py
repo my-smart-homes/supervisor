@@ -1,13 +1,16 @@
 """Test plugin manager."""
 
-from unittest.mock import PropertyMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from awesomeversion import AwesomeVersion
+import pytest
 
 from supervisor.coresys import CoreSys
 from supervisor.docker.interface import DockerInterface
 from supervisor.plugins.base import PluginBase
 from supervisor.supervisor import Supervisor
+
+from tests.common import MockResponse
 
 
 def mock_awaitable_bool(value: bool):
@@ -35,10 +38,14 @@ async def test_repair(coresys: CoreSys):
         assert install.call_count == len(coresys.plugins.all_plugins)
 
 
-async def test_load(coresys: CoreSys):
+@pytest.mark.usefixtures("no_job_throttle")
+async def test_load(
+    coresys: CoreSys, mock_update_data: MockResponse, supervisor_internet: AsyncMock
+):
     """Test plugin manager load."""
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
     await coresys.updater.load()
+    await coresys.updater.reload()
 
     need_update = PropertyMock(return_value=True)
     with (

@@ -20,10 +20,10 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 class HwMonitor(CoreSysAttributes):
     """Hardware monitor for supervisor."""
 
-    def __init__(self, coresys: CoreSys):
+    def __init__(self, coresys: CoreSys, context: pyudev.Context):
         """Initialize Hardware Monitor object."""
         self.coresys: CoreSys = coresys
-        self.context = pyudev.Context()
+        self.context = context
         self.monitor: pyudev.Monitor | None = None
         self.observer: pyudev.MonitorObserver | None = None
 
@@ -40,7 +40,7 @@ class HwMonitor(CoreSysAttributes):
                 ),
             )
         except OSError:
-            self.sys_resolution.unhealthy = UnhealthyReason.PRIVILEGED
+            self.sys_resolution.add_unhealthy_reason(UnhealthyReason.PRIVILEGED)
             _LOGGER.critical("Not privileged to run udev monitor!")
         else:
             self.observer.start()

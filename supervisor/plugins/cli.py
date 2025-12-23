@@ -14,10 +14,10 @@ from ..coresys import CoreSys
 from ..docker.cli import DockerCli
 from ..docker.const import ContainerState
 from ..docker.stats import DockerStats
-from ..exceptions import CliError, CliJobError, CliUpdateError, DockerError
-from ..jobs.const import JobExecutionLimit
+from ..exceptions import CliError, CliJobError, CliUpdateError, DockerError, PluginError
+from ..jobs.const import JobThrottle
 from ..jobs.decorator import Job
-from ..utils.sentry import capture_exception
+from ..utils.sentry import async_capture_exception
 from .base import PluginBase
 from .const import (
     FILE_HASSIO_CLI,
@@ -53,7 +53,7 @@ class PluginCli(PluginBase):
         return self.sys_updater.version_cli
 
     @property
-    def supervisor_token(self) -> str:
+    def supervisor_token(self) -> str | None:
         """Return an access token for the Supervisor API."""
         return self._data.get(ATTR_ACCESS_TOKEN)
 
@@ -66,14 +66,14 @@ class PluginCli(PluginBase):
         """Update local HA cli."""
         try:
             await super().update(version)
-        except DockerError as err:
+        except (DockerError, PluginError) as err:
             raise CliUpdateError("CLI update failed", _LOGGER.error) from err
 
     async def start(self) -> None:
         """Run cli."""
         # Create new API token
         self._data[ATTR_ACCESS_TOKEN] = secrets.token_hex(56)
-        self.save_data()
+        await self.save_data()
 
         # Start Instance
         _LOGGER.info("Starting CLI plugin")
@@ -114,14 +114,14 @@ class PluginCli(PluginBase):
             await self.instance.install(self.version)
         except DockerError as err:
             _LOGGER.error("Repair of HA cli failed")
-            capture_exception(err)
+            await async_capture_exception(err)
 
     @Job(
         name="plugin_cli_restart_after_problem",
-        limit=JobExecutionLimit.THROTTLE_RATE_LIMIT,
         throttle_period=WATCHDOG_THROTTLE_PERIOD,
         throttle_max_calls=WATCHDOG_THROTTLE_MAX_CALLS,
         on_condition=CliJobError,
+        throttle=JobThrottle.RATE_LIMIT,
     )
     async def _restart_after_problem(self, state: ContainerState):
         """Restart unhealthy or failed plugin."""

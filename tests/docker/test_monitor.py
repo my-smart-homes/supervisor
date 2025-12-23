@@ -88,7 +88,7 @@ async def test_events(
 ):
     """Test events created from docker events."""
     event["Actor"]["Attributes"]["name"] = "some_container"
-    event["id"] = "abc123"
+    event["Actor"]["ID"] = "abc123"
     event["time"] = 123
     with (
         patch(
@@ -120,7 +120,7 @@ async def test_unlabeled_container(coresys: CoreSys):
         }
     )
     with patch(
-        "supervisor.docker.manager.DockerAPI.containers",
+        "supervisor.docker.manager.DockerAPI.containers_legacy",
         new=PropertyMock(return_value=container_collection),
     ):
         await coresys.homeassistant.core.instance.attach(AwesomeVersion("2022.7.3"))
@@ -131,12 +131,12 @@ async def test_unlabeled_container(coresys: CoreSys):
             new=PropertyMock(
                 return_value=[
                     {
-                        "id": "abc123",
                         "time": 123,
                         "Type": "container",
                         "Action": "die",
                         "Actor": {
-                            "Attributes": {"name": "homeassistant", "exitCode": "137"}
+                            "ID": "abc123",
+                            "Attributes": {"name": "homeassistant", "exitCode": "137"},
                         },
                     }
                 ]

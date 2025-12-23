@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import YamlFileError
-from ..jobs.const import JobExecutionLimit
+from ..jobs.const import JobConcurrency, JobThrottle
 from ..jobs.decorator import Job
 from ..utils.yaml import read_yaml_file
 
@@ -43,24 +43,28 @@ class HomeAssistantSecrets(CoreSysAttributes):
 
     @Job(
         name="home_assistant_secrets_read",
-        limit=JobExecutionLimit.THROTTLE_WAIT,
         throttle_period=timedelta(seconds=60),
         internal=True,
+        concurrency=JobConcurrency.QUEUE,
+        throttle=JobThrottle.THROTTLE,
     )
     async def _read_secrets(self):
         """Read secrets.yaml into memory."""
-        if not self.path_secrets.exists():
-            _LOGGER.debug("Home Assistant secrets.yaml does not exist")
-            return
 
-        # Read secrets
-        try:
-            secrets = await self.sys_run_in_executor(read_yaml_file, self.path_secrets)
-        except YamlFileError as err:
-            _LOGGER.warning("Can't read Home Assistant secrets: %s", err)
-            return
+        def read_secrets_yaml() -> dict | None:
+            if not self.path_secrets.exists():
+                _LOGGER.debug("Home Assistant secrets.yaml does not exist")
+                return None
 
-        if not isinstance(secrets, dict):
+            # Read secrets
+            try:
+                return read_yaml_file(self.path_secrets)
+            except YamlFileError as err:
+                _LOGGER.warning("Can't read Home Assistant secrets: %s", err)
+                return None
+
+        secrets = await self.sys_run_in_executor(read_secrets_yaml)
+        if secrets is None or not isinstance(secrets, dict):
             return
 
         # Process secrets

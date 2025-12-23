@@ -5,29 +5,24 @@ from unittest.mock import MagicMock, patch
 
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
-from supervisor.resolution.evaluations.operating_system import (
-    SUPPORTED_OS,
-    EvaluateOperatingSystem,
-)
+from supervisor.resolution.evaluations.operating_system import EvaluateOperatingSystem
 
 
 async def test_evaluation(coresys: CoreSys):
     """Test evaluation."""
     operating_system = EvaluateOperatingSystem(coresys)
-    coresys.core.state = CoreState.SETUP
+    await coresys.core.set_state(CoreState.SETUP)
 
     assert operating_system.reason not in coresys.resolution.unsupported
 
-    coresys.host._info = MagicMock(operating_system="unsupported", timezone=None)
+    coresys.host._info = MagicMock(
+        operating_system="unsupported", timezone=None, timezone_tzinfo=None
+    )
     await operating_system()
     assert operating_system.reason in coresys.resolution.unsupported
 
     coresys.os._available = True
-    await operating_system()
-    assert operating_system.reason not in coresys.resolution.unsupported
-    coresys.os._available = False
-
-    coresys.host._info = MagicMock(operating_system=SUPPORTED_OS[0], timezone=None)
+    assert coresys.os.available
     await operating_system()
     assert operating_system.reason not in coresys.resolution.unsupported
 
@@ -45,13 +40,13 @@ async def test_did_run(coresys: CoreSys):
         return_value=None,
     ) as evaluate:
         for state in should_run:
-            coresys.core.state = state
+            await coresys.core.set_state(state)
             await operating_system()
             evaluate.assert_called_once()
             evaluate.reset_mock()
 
         for state in should_not_run:
-            coresys.core.state = state
+            await coresys.core.set_state(state)
             await operating_system()
             evaluate.assert_not_called()
             evaluate.reset_mock()

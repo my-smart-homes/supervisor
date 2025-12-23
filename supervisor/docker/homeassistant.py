@@ -1,20 +1,19 @@
 """Init file for Supervisor Docker object."""
 
-from collections.abc import Awaitable
 from ipaddress import IPv4Address
 import logging
 import re
 
-from awesomeversion import AwesomeVersion, AwesomeVersionCompareException
-from docker.types import Mount
+from awesomeversion import AwesomeVersion
 
-from ..const import LABEL_MACHINE, MACHINE_ID
+from ..const import LABEL_MACHINE
 from ..exceptions import DockerJobError
 from ..hardware.const import PolicyGroup
 from ..homeassistant.const import LANDINGPAGE
-from ..jobs.const import JobExecutionLimit
+from ..jobs.const import JobConcurrency
 from ..jobs.decorator import Job
 from .const import (
+    ENV_DUPLICATE_LOG_FILE,
     ENV_TIME,
     ENV_TOKEN,
     ENV_TOKEN_OLD,
@@ -22,6 +21,12 @@ from .const import (
     MOUNT_DEV,
     MOUNT_MACHINE_ID,
     MOUNT_UDEV,
+    PATH_MEDIA,
+    PATH_PUBLIC_CONFIG,
+    PATH_SHARE,
+    PATH_SSL,
+    DockerMount,
+    MountBindOptions,
     MountType,
     PropagationMode,
 )
@@ -31,6 +36,7 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 _VERIFY_TRUST: AwesomeVersion = AwesomeVersion("2021.5.0")
 _HASS_DOCKER_NAME: str = "homeassistant"
 ENV_S6_GRACETIME = re.compile(r"^S6_SERVICES_GRACETIME=([0-9]+)$")
+ENV_RESTORE_JOB_ID = "SUPERVISOR_RESTORE_JOB_ID"
 
 
 class DockerHomeAssistant(DockerInterface):
@@ -86,17 +92,17 @@ class DockerHomeAssistant(DockerInterface):
         )
 
     @property
-    def mounts(self) -> list[Mount]:
+    def mounts(self) -> list[DockerMount]:
         """Return mounts for container."""
         mounts = [
             MOUNT_DEV,
             MOUNT_DBUS,
             MOUNT_UDEV,
             # HA config folder
-            Mount(
+            DockerMount(
                 type=MountType.BIND,
                 source=self.sys_config.path_extern_homeassistant.as_posix(),
-                target="/config",
+                target=PATH_PUBLIC_CONFIG.as_posix(),
                 read_only=False,
             ),
         ]
@@ -106,40 +112,44 @@ class DockerHomeAssistant(DockerInterface):
             mounts.extend(
                 [
                     # All other folders
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=self.sys_config.path_extern_ssl.as_posix(),
-                        target="/ssl",
+                        target=PATH_SSL.as_posix(),
                         read_only=True,
                     ),
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=self.sys_config.path_extern_share.as_posix(),
-                        target="/share",
+                        target=PATH_SHARE.as_posix(),
                         read_only=False,
-                        propagation=PropagationMode.RSLAVE.value,
+                        bind_options=MountBindOptions(
+                            propagation=PropagationMode.RSLAVE
+                        ),
                     ),
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=self.sys_config.path_extern_media.as_posix(),
-                        target="/media",
+                        target=PATH_MEDIA.as_posix(),
                         read_only=False,
-                        propagation=PropagationMode.RSLAVE.value,
+                        bind_options=MountBindOptions(
+                            propagation=PropagationMode.RSLAVE
+                        ),
                     ),
                     # Configuration audio
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=self.sys_homeassistant.path_extern_pulse.as_posix(),
                         target="/etc/pulse/client.conf",
                         read_only=True,
                     ),
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=self.sys_plugins.audio.path_extern_pulse.as_posix(),
                         target="/run/audio",
                         read_only=True,
                     ),
-                    Mount(
+                    DockerMount(
                         type=MountType.BIND,
                         source=self.sys_plugins.audio.path_extern_asound.as_posix(),
                         target="/etc/asound.conf",
@@ -149,18 +159,29 @@ class DockerHomeAssistant(DockerInterface):
             )
 
         # Machine ID
-        if MACHINE_ID.exists():
+        if self.sys_machine_id:
             mounts.append(MOUNT_MACHINE_ID)
 
         return mounts
 
     @Job(
         name="docker_home_assistant_run",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
-    async def run(self) -> None:
+    async def run(self, *, restore_job_id: str | None = None) -> None:
         """Run Docker image."""
+        environment = {
+            "SUPERVISOR": self.sys_docker.network.supervisor,
+            "HASSIO": self.sys_docker.network.supervisor,
+            ENV_TIME: self.sys_timezone,
+            ENV_TOKEN: self.sys_homeassistant.supervisor_token,
+            ENV_TOKEN_OLD: self.sys_homeassistant.supervisor_token,
+        }
+        if restore_job_id:
+            environment[ENV_RESTORE_JOB_ID] = restore_job_id
+        if self.sys_homeassistant.duplicate_log_file:
+            environment[ENV_DUPLICATE_LOG_FILE] = "1"
         await self._run(
             tag=(self.sys_homeassistant.version),
             name=self.name,
@@ -176,13 +197,7 @@ class DockerHomeAssistant(DockerInterface):
                 "supervisor": self.sys_docker.network.supervisor,
                 "observer": self.sys_docker.network.observer,
             },
-            environment={
-                "SUPERVISOR": self.sys_docker.network.supervisor,
-                "HASSIO": self.sys_docker.network.supervisor,
-                ENV_TIME: self.sys_timezone,
-                ENV_TOKEN: self.sys_homeassistant.supervisor_token,
-                ENV_TOKEN_OLD: self.sys_homeassistant.supervisor_token,
-            },
+            environment=environment,
             tmpfs={"/tmp": ""},  # noqa: S108
             oom_score_adj=-300,
         )
@@ -192,8 +207,8 @@ class DockerHomeAssistant(DockerInterface):
 
     @Job(
         name="docker_home_assistant_execute_command",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def execute_command(self, command: str) -> CommandReturn:
         """Create a temporary container and run command."""
@@ -205,23 +220,20 @@ class DockerHomeAssistant(DockerInterface):
             privileged=True,
             init=True,
             entrypoint=[],
-            detach=True,
-            stdout=True,
-            stderr=True,
             mounts=[
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_homeassistant.as_posix(),
                     target="/config",
                     read_only=False,
                 ),
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_ssl.as_posix(),
                     target="/ssl",
                     read_only=True,
                 ),
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_share.as_posix(),
                     target="/share",
@@ -231,23 +243,10 @@ class DockerHomeAssistant(DockerInterface):
             environment={ENV_TIME: self.sys_timezone},
         )
 
-    def is_initialize(self) -> Awaitable[bool]:
+    async def is_initialize(self) -> bool:
         """Return True if Docker container exists."""
-        return self.sys_run_in_executor(
-            self.sys_docker.container_is_initialized,
-            self.name,
-            self.image,
-            self.sys_homeassistant.version,
+        if not self.sys_homeassistant.version:
+            return False
+        return await self.sys_docker.container_is_initialized(
+            self.name, self.image, self.sys_homeassistant.version
         )
-
-    async def _validate_trust(
-        self, image_id: str, image: str, version: AwesomeVersion
-    ) -> None:
-        """Validate trust of content."""
-        try:
-            if version != LANDINGPAGE and version < _VERIFY_TRUST:
-                return
-        except AwesomeVersionCompareException:
-            return
-
-        await super()._validate_trust(image_id, image, version)

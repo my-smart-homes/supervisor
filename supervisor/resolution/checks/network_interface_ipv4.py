@@ -2,7 +2,7 @@
 
 from ...const import CoreState
 from ...coresys import CoreSys
-from ...dbus.const import ConnectionStateFlags, ConnectionStateType
+from ...dbus.const import ConnectionState, ConnectionStateFlags
 from ...dbus.network.interface import NetworkInterface
 from ...exceptions import NetworkInterfaceNotFound
 from ..const import ContextType, IssueType
@@ -19,12 +19,12 @@ class CheckNetworkInterfaceIPV4(CheckBase):
 
     async def run_check(self) -> None:
         """Run check if not affected by issue."""
-        for interface in self.sys_dbus.network.interfaces:
-            if CheckNetworkInterfaceIPV4.check_interface(interface):
+        for inet in self.sys_dbus.network.interfaces:
+            if CheckNetworkInterfaceIPV4.check_interface(inet):
                 self.sys_resolution.create_issue(
                     IssueType.IPV4_CONNECTION_PROBLEM,
                     ContextType.SYSTEM,
-                    interface.name,
+                    inet.interface_name,
                 )
 
     async def approve_check(self, reference: str | None = None) -> bool:
@@ -47,7 +47,7 @@ class CheckNetworkInterfaceIPV4(CheckBase):
 
         return not (
             interface.connection.state
-            in [ConnectionStateType.ACTIVATED, ConnectionStateType.ACTIVATING]
+            in [ConnectionState.ACTIVATED, ConnectionState.ACTIVATING]
             and ConnectionStateFlags.IP4_READY in interface.connection.state_flags
         )
 

@@ -54,7 +54,7 @@ async def test_api_list_discovery(
         ),
         patch("supervisor.utils.common.Path.is_file", return_value=True),
     ):
-        coresys.discovery.read_data()
+        await coresys.discovery.read_data()
 
     await coresys.discovery.load()
     assert coresys.discovery.list_messages == [
@@ -84,12 +84,14 @@ async def test_api_list_discovery(
 
 @pytest.mark.parametrize("api_client", [TEST_ADDON_SLUG], indirect=True)
 async def test_api_send_del_discovery(
-    api_client: TestClient, coresys: CoreSys, install_addon_ssh: Addon
+    api_client: TestClient,
+    coresys: CoreSys,
+    install_addon_ssh: Addon,
+    websession: MagicMock,
 ):
     """Test adding and removing discovery."""
     install_addon_ssh.data["discovery"] = ["test"]
     coresys.homeassistant.api.ensure_access_token = AsyncMock()
-    coresys.websession.post = MagicMock()
 
     resp = await api_client.post("/discovery", json={"service": "test", "config": {}})
     assert resp.status == 200
@@ -138,3 +140,15 @@ async def test_api_invalid_discovery(api_client: TestClient, install_addon_ssh: 
 
     resp = await api_client.post("/discovery", json={"service": "test", "config": None})
     assert resp.status == 400
+
+
+@pytest.mark.parametrize(
+    ("method", "url"),
+    [("get", "/discovery/bad"), ("delete", "/discovery/bad")],
+)
+async def test_discovery_not_found(api_client: TestClient, method: str, url: str):
+    """Test discovery not found error."""
+    resp = await api_client.request(method, url)
+    assert resp.status == 404
+    resp = await resp.json()
+    assert resp["message"] == "Discovery message not found"

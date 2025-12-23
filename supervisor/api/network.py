@@ -10,6 +10,7 @@ import voluptuous as vol
 
 from ..const import (
     ATTR_ACCESSPOINTS,
+    ATTR_ADDR_GEN_MODE,
     ATTR_ADDRESS,
     ATTR_AUTH,
     ATTR_CONNECTED,
@@ -22,9 +23,12 @@ from ..const import (
     ATTR_ID,
     ATTR_INTERFACE,
     ATTR_INTERFACES,
+    ATTR_IP6_PRIVACY,
     ATTR_IPV4,
     ATTR_IPV6,
+    ATTR_LLMNR,
     ATTR_MAC,
+    ATTR_MDNS,
     ATTR_METHOD,
     ATTR_MODE,
     ATTR_NAMESERVERS,
@@ -38,17 +42,21 @@ from ..const import (
     ATTR_TYPE,
     ATTR_VLAN,
     ATTR_WIFI,
+    DOCKER_IPV4_NETWORK_MASK,
     DOCKER_NETWORK,
-    DOCKER_NETWORK_MASK,
 )
 from ..coresys import CoreSysAttributes
-from ..exceptions import APIError, HostNetworkNotFound
+from ..exceptions import APIError, APINotFound, HostNetworkNotFound
 from ..host.configuration import (
     AccessPoint,
     Interface,
+    InterfaceAddrGenMode,
+    InterfaceIp6Privacy,
     InterfaceMethod,
+    Ip6Setting,
     IpConfig,
     IpSetting,
+    MulticastDnsMode,
     VlanConfig,
     WifiConfig,
 )
@@ -68,6 +76,8 @@ _SCHEMA_IPV6_CONFIG = vol.Schema(
     {
         vol.Optional(ATTR_ADDRESS): [vol.Coerce(IPv6Interface)],
         vol.Optional(ATTR_METHOD): vol.Coerce(InterfaceMethod),
+        vol.Optional(ATTR_ADDR_GEN_MODE): vol.Coerce(InterfaceAddrGenMode),
+        vol.Optional(ATTR_IP6_PRIVACY): vol.Coerce(InterfaceIp6Privacy),
         vol.Optional(ATTR_GATEWAY): vol.Coerce(IPv6Address),
         vol.Optional(ATTR_NAMESERVERS): [vol.Coerce(IPv6Address)],
     }
@@ -90,14 +100,29 @@ SCHEMA_UPDATE = vol.Schema(
         vol.Optional(ATTR_IPV6): _SCHEMA_IPV6_CONFIG,
         vol.Optional(ATTR_WIFI): _SCHEMA_WIFI_CONFIG,
         vol.Optional(ATTR_ENABLED): vol.Boolean(),
+        vol.Optional(ATTR_MDNS): vol.Coerce(MulticastDnsMode),
+        vol.Optional(ATTR_LLMNR): vol.Coerce(MulticastDnsMode),
     }
 )
 
 
-def ipconfig_struct(config: IpConfig, setting: IpSetting) -> dict[str, Any]:
-    """Return a dict with information about ip configuration."""
+def ip4config_struct(config: IpConfig, setting: IpSetting) -> dict[str, Any]:
+    """Return a dict with information about IPv4 configuration."""
     return {
         ATTR_METHOD: setting.method,
+        ATTR_ADDRESS: [address.with_prefixlen for address in config.address],
+        ATTR_NAMESERVERS: [str(address) for address in config.nameservers],
+        ATTR_GATEWAY: str(config.gateway) if config.gateway else None,
+        ATTR_READY: config.ready,
+    }
+
+
+def ip6config_struct(config: IpConfig, setting: Ip6Setting) -> dict[str, Any]:
+    """Return a dict with information about IPv6 configuration."""
+    return {
+        ATTR_METHOD: setting.method,
+        ATTR_ADDR_GEN_MODE: setting.addr_gen_mode,
+        ATTR_IP6_PRIVACY: setting.ip6_privacy,
         ATTR_ADDRESS: [address.with_prefixlen for address in config.address],
         ATTR_NAMESERVERS: [str(address) for address in config.nameservers],
         ATTR_GATEWAY: str(config.gateway) if config.gateway else None,
@@ -132,10 +157,16 @@ def interface_struct(interface: Interface) -> dict[str, Any]:
         ATTR_CONNECTED: interface.connected,
         ATTR_PRIMARY: interface.primary,
         ATTR_MAC: interface.mac,
-        ATTR_IPV4: ipconfig_struct(interface.ipv4, interface.ipv4setting),
-        ATTR_IPV6: ipconfig_struct(interface.ipv6, interface.ipv6setting),
+        ATTR_IPV4: ip4config_struct(interface.ipv4, interface.ipv4setting)
+        if interface.ipv4 and interface.ipv4setting
+        else None,
+        ATTR_IPV6: ip6config_struct(interface.ipv6, interface.ipv6setting)
+        if interface.ipv6 and interface.ipv6setting
+        else None,
         ATTR_WIFI: wifi_struct(interface.wifi) if interface.wifi else None,
         ATTR_VLAN: vlan_struct(interface.vlan) if interface.vlan else None,
+        ATTR_MDNS: interface.mdns,
+        ATTR_LLMNR: interface.llmnr,
     }
 
 
@@ -167,7 +198,7 @@ class APINetwork(CoreSysAttributes):
             except HostNetworkNotFound:
                 pass
 
-        raise APIError(f"Interface {name} does not exist") from None
+        raise APINotFound(f"Interface {name} does not exist") from None
 
     @api_process
     async def info(self, request: web.Request) -> dict[str, Any]:
@@ -179,7 +210,7 @@ class APINetwork(CoreSysAttributes):
             ],
             ATTR_DOCKER: {
                 ATTR_INTERFACE: DOCKER_NETWORK,
-                ATTR_ADDRESS: str(DOCKER_NETWORK_MASK),
+                ATTR_ADDRESS: str(DOCKER_IPV4_NETWORK_MASK),
                 ATTR_GATEWAY: str(self.sys_docker.network.gateway),
                 ATTR_DNS: str(self.sys_docker.network.dns),
             },
@@ -190,14 +221,14 @@ class APINetwork(CoreSysAttributes):
     @api_process
     async def interface_info(self, request: web.Request) -> dict[str, Any]:
         """Return network information for a interface."""
-        interface = self._get_interface(request.match_info.get(ATTR_INTERFACE))
+        interface = self._get_interface(request.match_info[ATTR_INTERFACE])
 
         return interface_struct(interface)
 
     @api_process
     async def interface_update(self, request: web.Request) -> None:
         """Update the configuration of an interface."""
-        interface = self._get_interface(request.match_info.get(ATTR_INTERFACE))
+        interface = self._get_interface(request.match_info[ATTR_INTERFACE])
 
         # Validate data
         body = await api_validate(SCHEMA_UPDATE, request)
@@ -208,28 +239,38 @@ class APINetwork(CoreSysAttributes):
         for key, config in body.items():
             if key == ATTR_IPV4:
                 interface.ipv4setting = IpSetting(
-                    config.get(ATTR_METHOD, InterfaceMethod.STATIC),
-                    config.get(ATTR_ADDRESS, []),
-                    config.get(ATTR_GATEWAY),
-                    config.get(ATTR_NAMESERVERS, []),
+                    method=config.get(ATTR_METHOD, InterfaceMethod.STATIC),
+                    address=config.get(ATTR_ADDRESS, []),
+                    gateway=config.get(ATTR_GATEWAY),
+                    nameservers=config.get(ATTR_NAMESERVERS, []),
                 )
             elif key == ATTR_IPV6:
-                interface.ipv6setting = IpSetting(
-                    config.get(ATTR_METHOD, InterfaceMethod.STATIC),
-                    config.get(ATTR_ADDRESS, []),
-                    config.get(ATTR_GATEWAY),
-                    config.get(ATTR_NAMESERVERS, []),
+                interface.ipv6setting = Ip6Setting(
+                    method=config.get(ATTR_METHOD, InterfaceMethod.STATIC),
+                    addr_gen_mode=config.get(
+                        ATTR_ADDR_GEN_MODE, InterfaceAddrGenMode.DEFAULT
+                    ),
+                    ip6_privacy=config.get(
+                        ATTR_IP6_PRIVACY, InterfaceIp6Privacy.DEFAULT
+                    ),
+                    address=config.get(ATTR_ADDRESS, []),
+                    gateway=config.get(ATTR_GATEWAY),
+                    nameservers=config.get(ATTR_NAMESERVERS, []),
                 )
             elif key == ATTR_WIFI:
                 interface.wifi = WifiConfig(
-                    config.get(ATTR_MODE, WifiMode.INFRASTRUCTURE),
-                    config.get(ATTR_SSID, ""),
-                    config.get(ATTR_AUTH, AuthMethod.OPEN),
-                    config.get(ATTR_PSK, None),
-                    None,
+                    mode=config.get(ATTR_MODE, WifiMode.INFRASTRUCTURE),
+                    ssid=config.get(ATTR_SSID, ""),
+                    auth=config.get(ATTR_AUTH, AuthMethod.OPEN),
+                    psk=config.get(ATTR_PSK, None),
+                    signal=None,
                 )
             elif key == ATTR_ENABLED:
                 interface.enabled = config
+            elif key == ATTR_MDNS:
+                interface.mdns = config
+            elif key == ATTR_LLMNR:
+                interface.llmnr = config
 
         await asyncio.shield(self.sys_host.network.apply_changes(interface))
 
@@ -243,7 +284,7 @@ class APINetwork(CoreSysAttributes):
     @api_process
     async def scan_accesspoints(self, request: web.Request) -> dict[str, Any]:
         """Scan and return a list of available networks."""
-        interface = self._get_interface(request.match_info.get(ATTR_INTERFACE))
+        interface = self._get_interface(request.match_info[ATTR_INTERFACE])
 
         # Only wlan is supported
         if interface.type != InterfaceType.WIRELESS:
@@ -256,8 +297,10 @@ class APINetwork(CoreSysAttributes):
     @api_process
     async def create_vlan(self, request: web.Request) -> None:
         """Create a new vlan."""
-        interface = self._get_interface(request.match_info.get(ATTR_INTERFACE))
-        vlan = int(request.match_info.get(ATTR_VLAN))
+        interface = self._get_interface(request.match_info[ATTR_INTERFACE])
+        vlan = int(request.match_info.get(ATTR_VLAN, -1))
+        if vlan < 0:
+            raise APIError(f"Invalid vlan specified: {vlan}")
 
         # Only ethernet is supported
         if interface.type != InterfaceType.ETHERNET:
@@ -268,26 +311,41 @@ class APINetwork(CoreSysAttributes):
 
         vlan_config = VlanConfig(vlan, interface.name)
 
+        mdns_mode = MulticastDnsMode.DEFAULT
+        llmnr_mode = MulticastDnsMode.DEFAULT
+
+        if ATTR_MDNS in body:
+            mdns_mode = body[ATTR_MDNS]
+
+        if ATTR_LLMNR in body:
+            llmnr_mode = body[ATTR_LLMNR]
+
         ipv4_setting = None
         if ATTR_IPV4 in body:
             ipv4_setting = IpSetting(
-                body[ATTR_IPV4].get(ATTR_METHOD, InterfaceMethod.AUTO),
-                body[ATTR_IPV4].get(ATTR_ADDRESS, []),
-                body[ATTR_IPV4].get(ATTR_GATEWAY, None),
-                body[ATTR_IPV4].get(ATTR_NAMESERVERS, []),
+                method=body[ATTR_IPV4].get(ATTR_METHOD, InterfaceMethod.AUTO),
+                address=body[ATTR_IPV4].get(ATTR_ADDRESS, []),
+                gateway=body[ATTR_IPV4].get(ATTR_GATEWAY, None),
+                nameservers=body[ATTR_IPV4].get(ATTR_NAMESERVERS, []),
             )
 
         ipv6_setting = None
         if ATTR_IPV6 in body:
-            ipv6_setting = IpSetting(
-                body[ATTR_IPV6].get(ATTR_METHOD, InterfaceMethod.AUTO),
-                body[ATTR_IPV6].get(ATTR_ADDRESS, []),
-                body[ATTR_IPV6].get(ATTR_GATEWAY, None),
-                body[ATTR_IPV6].get(ATTR_NAMESERVERS, []),
+            ipv6_setting = Ip6Setting(
+                method=body[ATTR_IPV6].get(ATTR_METHOD, InterfaceMethod.AUTO),
+                addr_gen_mode=body[ATTR_IPV6].get(
+                    ATTR_ADDR_GEN_MODE, InterfaceAddrGenMode.DEFAULT
+                ),
+                ip6_privacy=body[ATTR_IPV6].get(
+                    ATTR_IP6_PRIVACY, InterfaceIp6Privacy.DEFAULT
+                ),
+                address=body[ATTR_IPV6].get(ATTR_ADDRESS, []),
+                gateway=body[ATTR_IPV6].get(ATTR_GATEWAY, None),
+                nameservers=body[ATTR_IPV6].get(ATTR_NAMESERVERS, []),
             )
 
         vlan_interface = Interface(
-            "",
+            f"{interface.name}.{vlan}",
             "",
             "",
             True,
@@ -300,5 +358,7 @@ class APINetwork(CoreSysAttributes):
             ipv6_setting,
             None,
             vlan_config,
+            mdns=mdns_mode,
+            llmnr=llmnr_mode,
         )
-        await asyncio.shield(self.sys_host.network.apply_changes(vlan_interface))
+        await asyncio.shield(self.sys_host.network.create_vlan(vlan_interface))

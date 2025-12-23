@@ -3,22 +3,24 @@
 import asyncio
 from unittest.mock import MagicMock, PropertyMock, patch
 
+from aiohttp import ClientResponse
 from aiohttp.test_utils import TestClient
+from docker.errors import DockerException
 import pytest
 
 from supervisor.addons.addon import Addon
 from supervisor.addons.build import AddonBuild
-from supervisor.arch import CpuArch
+from supervisor.arch import CpuArchManager
 from supervisor.const import AddonState
 from supervisor.coresys import CoreSys
 from supervisor.docker.addon import DockerAddon
 from supervisor.docker.const import ContainerState
+from supervisor.docker.manager import CommandReturn
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import HassioError
 from supervisor.store.repository import Repository
 
 from ..const import TEST_ADDON_SLUG
-from . import common_test_api_advanced_logs
 
 
 def _create_test_event(name: str, state: ContainerState) -> DockerContainerStateEvent:
@@ -52,7 +54,7 @@ async def test_addons_info(
 
 # DEPRECATED - Remove with legacy routing logic on 1/2023
 async def test_addons_info_not_installed(
-    api_client: TestClient, coresys: CoreSys, repository: Repository
+    api_client: TestClient, coresys: CoreSys, test_repository: Repository
 ):
     """Test getting addon info for not installed addon."""
     resp = await api_client.get(f"/addons/{TEST_ADDON_SLUG}/info")
@@ -70,19 +72,18 @@ async def test_addons_info_not_installed(
 
 
 async def test_api_addon_logs(
-    api_client: TestClient, journald_logs: MagicMock, install_addon_ssh: Addon
+    advanced_logs_tester,
+    install_addon_ssh: Addon,
 ):
     """Test addon logs."""
-    await common_test_api_advanced_logs(
-        "/addons/local_ssh", "addon_local_ssh", api_client, journald_logs
-    )
+    await advanced_logs_tester("/addons/local_ssh", "addon_local_ssh")
 
 
 async def test_api_addon_logs_not_installed(api_client: TestClient):
     """Test error is returned for non-existing add-on."""
     resp = await api_client.get("/addons/hic_sunt_leones/logs")
 
-    assert resp.status == 400
+    assert resp.status == 404
     assert resp.content_type == "text/plain"
     content = await resp.text()
     assert content == "Addon hic_sunt_leones does not exist"
@@ -233,17 +234,128 @@ async def test_api_addon_rebuild_healthcheck(
         _container_events_task = asyncio.create_task(container_events())
 
     with (
-        patch.object(AddonBuild, "is_valid", new=PropertyMock(return_value=True)),
+        patch.object(AddonBuild, "is_valid", return_value=True),
         patch.object(DockerAddon, "is_running", return_value=False),
         patch.object(Addon, "need_build", new=PropertyMock(return_value=True)),
-        patch.object(CpuArch, "supported", new=PropertyMock(return_value=["amd64"])),
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+        ),
         patch.object(DockerAddon, "run", new=container_events_task),
+        patch.object(
+            coresys.docker,
+            "run_command",
+            new=PropertyMock(return_value=CommandReturn(0, b"Build successful")),
+        ),
+        patch.object(
+            DockerAddon, "healthcheck", new=PropertyMock(return_value={"exists": True})
+        ),
+        patch.object(
+            type(coresys.config),
+            "local_to_extern_path",
+            return_value="/addon/path/on/host",
+        ),
     ):
         resp = await api_client.post("/addons/local_ssh/rebuild")
 
     assert state_changes == [AddonState.STOPPED, AddonState.STARTUP]
     assert install_addon_ssh.state == AddonState.STARTED
     assert resp.status == 200
+
+
+async def test_api_addon_rebuild_force(
+    api_client: TestClient,
+    coresys: CoreSys,
+    install_addon_ssh: Addon,
+    container: MagicMock,
+    tmp_supervisor_data,
+    path_extern,
+):
+    """Test rebuilding an image-based addon with force parameter."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    container.status = "running"
+    install_addon_ssh.path_data.mkdir()
+    container.attrs["Config"] = {"Healthcheck": "exists"}
+    await install_addon_ssh.load()
+    await asyncio.sleep(0)
+    assert install_addon_ssh.state == AddonState.STARTUP
+
+    state_changes: list[AddonState] = []
+    _container_events_task: asyncio.Task | None = None
+
+    async def container_events():
+        nonlocal state_changes
+
+        await install_addon_ssh.container_state_changed(
+            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.STOPPED)
+        )
+        state_changes.append(install_addon_ssh.state)
+
+        await install_addon_ssh.container_state_changed(
+            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+        )
+        state_changes.append(install_addon_ssh.state)
+        await asyncio.sleep(0)
+
+        await install_addon_ssh.container_state_changed(
+            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
+        )
+
+    async def container_events_task(*args, **kwargs):
+        nonlocal _container_events_task
+        _container_events_task = asyncio.create_task(container_events())
+
+    # Test 1: Without force, image-based addon should fail
+    with (
+        patch.object(AddonBuild, "is_valid", return_value=True),
+        patch.object(DockerAddon, "is_running", return_value=False),
+        patch.object(
+            Addon, "need_build", new=PropertyMock(return_value=False)
+        ),  # Image-based
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+        ),
+    ):
+        resp = await api_client.post("/addons/local_ssh/rebuild")
+
+    assert resp.status == 400
+    result = await resp.json()
+    assert "Can't rebuild a image based add-on" in result["message"]
+
+    # Reset state for next test
+    state_changes.clear()
+
+    # Test 2: With force=True, image-based addon should succeed
+    with (
+        patch.object(AddonBuild, "is_valid", return_value=True),
+        patch.object(DockerAddon, "is_running", return_value=False),
+        patch.object(
+            Addon, "need_build", new=PropertyMock(return_value=False)
+        ),  # Image-based
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+        ),
+        patch.object(DockerAddon, "run", new=container_events_task),
+        patch.object(
+            coresys.docker,
+            "run_command",
+            new=PropertyMock(return_value=CommandReturn(0, b"Build successful")),
+        ),
+        patch.object(
+            DockerAddon, "healthcheck", new=PropertyMock(return_value={"exists": True})
+        ),
+        patch.object(
+            type(coresys.config),
+            "local_to_extern_path",
+            return_value="/addon/path/on/host",
+        ),
+    ):
+        resp = await api_client.post("/addons/local_ssh/rebuild", json={"force": True})
+
+    assert state_changes == [AddonState.STOPPED, AddonState.STARTUP]
+    assert install_addon_ssh.state == AddonState.STARTED
+    assert resp.status == 200
+
+    await _container_events_task
 
 
 async def test_api_addon_uninstall(
@@ -366,3 +478,227 @@ async def test_addon_options_boot_mode_manual_only_invalid(
         body["message"]
         == "Addon local_example boot option is set to manual_only so it cannot be changed"
     )
+    assert body["error_key"] == "addon_boot_config_cannot_change_error"
+    assert body["extra_fields"] == {
+        "addon": "local_example",
+        "boot_config": "manual_only",
+    }
+
+
+async def get_message(resp: ClientResponse, json_expected: bool) -> str:
+    """Get message from response based on response type."""
+    if json_expected:
+        body = await resp.json()
+        return body["message"]
+    return await resp.text()
+
+
+@pytest.mark.parametrize(
+    ("method", "url", "json_expected"),
+    [
+        ("get", "/addons/bad/info", True),
+        ("post", "/addons/bad/uninstall", True),
+        ("post", "/addons/bad/start", True),
+        ("post", "/addons/bad/stop", True),
+        ("post", "/addons/bad/restart", True),
+        ("post", "/addons/bad/options", True),
+        ("post", "/addons/bad/sys_options", True),
+        ("post", "/addons/bad/options/validate", True),
+        ("post", "/addons/bad/rebuild", True),
+        ("post", "/addons/bad/stdin", True),
+        ("post", "/addons/bad/security", True),
+        ("get", "/addons/bad/stats", True),
+        ("get", "/addons/bad/logs", False),
+        ("get", "/addons/bad/logs/follow", False),
+        ("get", "/addons/bad/logs/boots/1", False),
+        ("get", "/addons/bad/logs/boots/1/follow", False),
+    ],
+)
+async def test_addon_not_found(
+    api_client: TestClient, method: str, url: str, json_expected: bool
+):
+    """Test addon not found error."""
+    resp = await api_client.request(method, url)
+    assert resp.status == 404
+    assert await get_message(resp, json_expected) == "Addon bad does not exist"
+
+
+@pytest.mark.parametrize(
+    ("method", "url", "json_expected"),
+    [
+        ("post", "/addons/local_ssh/uninstall", True),
+        ("post", "/addons/local_ssh/start", True),
+        ("post", "/addons/local_ssh/stop", True),
+        ("post", "/addons/local_ssh/restart", True),
+        ("post", "/addons/local_ssh/options", True),
+        ("post", "/addons/local_ssh/sys_options", True),
+        ("post", "/addons/local_ssh/options/validate", True),
+        ("post", "/addons/local_ssh/rebuild", True),
+        ("post", "/addons/local_ssh/stdin", True),
+        ("post", "/addons/local_ssh/security", True),
+        ("get", "/addons/local_ssh/stats", True),
+        ("get", "/addons/local_ssh/logs", False),
+        ("get", "/addons/local_ssh/logs/follow", False),
+        ("get", "/addons/local_ssh/logs/boots/1", False),
+        ("get", "/addons/local_ssh/logs/boots/1/follow", False),
+    ],
+)
+@pytest.mark.usefixtures("test_repository")
+async def test_addon_not_installed(
+    api_client: TestClient, method: str, url: str, json_expected: bool
+):
+    """Test addon not installed error."""
+    resp = await api_client.request(method, url)
+    assert resp.status == 400
+    assert await get_message(resp, json_expected) == "Addon is not installed"
+
+
+async def test_addon_set_options(api_client: TestClient, install_addon_example: Addon):
+    """Test setting options for an addon."""
+    resp = await api_client.post(
+        "/addons/local_example/options", json={"options": {"message": "test"}}
+    )
+    assert resp.status == 200
+    assert install_addon_example.options == {"message": "test"}
+
+
+async def test_addon_reset_options(
+    api_client: TestClient, install_addon_example: Addon
+):
+    """Test resetting options for an addon to defaults.
+
+    Fixes SUPERVISOR-171F.
+    """
+    # First set some custom options
+    install_addon_example.options = {"message": "custom"}
+    assert install_addon_example.persist["options"] == {"message": "custom"}
+
+    # Reset to defaults by sending null
+    resp = await api_client.post(
+        "/addons/local_example/options", json={"options": None}
+    )
+    assert resp.status == 200
+
+    # Persisted options should be empty (meaning defaults will be used)
+    assert install_addon_example.persist["options"] == {}
+
+
+async def test_addon_set_options_error(
+    api_client: TestClient, install_addon_example: Addon
+):
+    """Test setting options for an addon."""
+    resp = await api_client.post(
+        "/addons/local_example/options", json={"options": {"message": True}}
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert (
+        body["message"]
+        == "Add-on local_example has invalid options: not a valid value. Got {'message': True}"
+    )
+    assert body["error_key"] == "addon_configuration_invalid_error"
+    assert body["extra_fields"] == {
+        "addon": "local_example",
+        "validation_error": "not a valid value. Got {'message': True}",
+    }
+
+
+async def test_addon_start_options_error(
+    api_client: TestClient,
+    install_addon_example: Addon,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Test error writing options when trying to start addon."""
+    install_addon_example.options = {"message": "hello"}
+
+    # Simulate OS error trying to write the file
+    with patch("supervisor.utils.json.atomic_write", side_effect=OSError("fail")):
+        resp = await api_client.post("/addons/local_example/start")
+        assert resp.status == 500
+        body = await resp.json()
+        assert (
+            body["message"]
+            == "An unknown error occurred with addon local_example. Check supervisor logs for details (check with 'ha supervisor logs')"
+        )
+        assert body["error_key"] == "addon_unknown_error"
+        assert body["extra_fields"] == {
+            "addon": "local_example",
+            "logs_command": "ha supervisor logs",
+        }
+        assert "Add-on local_example can't write options" in caplog.text
+
+    # Simulate an update with a breaking change for options schema creating failure on start
+    caplog.clear()
+    install_addon_example.data["schema"] = {"message": "bool"}
+    resp = await api_client.post("/addons/local_example/start")
+    assert resp.status == 400
+    body = await resp.json()
+    assert (
+        body["message"]
+        == "Add-on local_example has invalid options: expected boolean. Got {'message': 'hello'}"
+    )
+    assert body["error_key"] == "addon_configuration_invalid_error"
+    assert body["extra_fields"] == {
+        "addon": "local_example",
+        "validation_error": "expected boolean. Got {'message': 'hello'}",
+    }
+    assert (
+        "Add-on local_example has invalid options: expected boolean. Got {'message': 'hello'}"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize(("method", "action"), [("get", "stats"), ("post", "stdin")])
+@pytest.mark.usefixtures("install_addon_example")
+async def test_addon_not_running_error(
+    api_client: TestClient, method: str, action: str
+):
+    """Test addon not running error for endpoints that require that."""
+    with patch.object(Addon, "with_stdin", new=PropertyMock(return_value=True)):
+        resp = await api_client.request(method, f"/addons/local_example/{action}")
+
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["message"] == "Add-on local_example is not running"
+    assert body["error_key"] == "addon_not_running_error"
+    assert body["extra_fields"] == {"addon": "local_example"}
+
+
+@pytest.mark.usefixtures("install_addon_example")
+async def test_addon_write_stdin_not_supported_error(api_client: TestClient):
+    """Test error when trying to write stdin to addon that does not support it."""
+    resp = await api_client.post("/addons/local_example/stdin")
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["message"] == "Add-on local_example does not support writing to stdin"
+    assert body["error_key"] == "addon_not_supported_write_stdin_error"
+    assert body["extra_fields"] == {"addon": "local_example"}
+
+
+@pytest.mark.usefixtures("install_addon_ssh")
+async def test_addon_rebuild_fails_error(api_client: TestClient, coresys: CoreSys):
+    """Test error when build fails during rebuild for addon."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.docker.containers_legacy.run.side_effect = DockerException("fail")
+
+    with (
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["aarch64"])
+        ),
+        patch.object(
+            CpuArchManager, "default", new=PropertyMock(return_value="aarch64")
+        ),
+        patch.object(AddonBuild, "get_docker_args", return_value={}),
+    ):
+        resp = await api_client.post("/addons/local_ssh/rebuild")
+    assert resp.status == 500
+    body = await resp.json()
+    assert (
+        body["message"]
+        == "An unknown error occurred while trying to build the image for addon local_ssh. Check supervisor logs for details (check with 'ha supervisor logs')"
+    )
+    assert body["error_key"] == "addon_build_failed_unknown_error"
+    assert body["extra_fields"] == {
+        "addon": "local_ssh",
+        "logs_command": "ha supervisor logs",
+    }

@@ -1,12 +1,18 @@
 """Common test functions."""
 
+import asyncio
+from collections.abc import Sequence
+from datetime import datetime
+from functools import partial
 from importlib import import_module
+from inspect import getclosurevars
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from dbus_fast.aio.message_bus import MessageBus
 
+from supervisor.jobs.decorator import Job
 from supervisor.resolution.validate import get_valid_modules
 from supervisor.utils.yaml import read_yaml_file
 
@@ -65,7 +71,9 @@ async def mock_dbus_services(
     services: dict[str, list[DBusServiceMock] | DBusServiceMock] = {}
     requested_names: set[str] = set()
 
-    for module in get_valid_modules("dbus_service_mocks", base=__file__):
+    for module in await asyncio.get_running_loop().run_in_executor(
+        None, partial(get_valid_modules, base=__file__), "dbus_service_mocks"
+    ):
         if module in to_mock:
             service_module = import_module(f"{__package__}.dbus_service_mocks.{module}")
 
@@ -82,3 +90,78 @@ async def mock_dbus_services(
                 services[module] = service_module.setup(to_mock[module]).export(bus)
 
     return services
+
+
+def get_job_decorator(func) -> Job:
+    """Get Job object of decorated function."""
+    # Access the closure of the wrapper function
+    job = getclosurevars(func).nonlocals["self"]
+    if not isinstance(job, Job):
+        raise TypeError(f"{func.__qualname__} is not a Job")
+    return job
+
+
+def reset_last_call(func, group: str | None = None) -> None:
+    """Reset last call for a function using the Job decorator."""
+    get_job_decorator(func).set_last_call(datetime.min, group)
+
+
+def is_in_list(a: list, b: list):
+    """Check if all elements in list a are in list b in order.
+
+    Taken from https://stackoverflow.com/a/69175987/12156188.
+    """
+
+    for c in a:
+        if c in b:
+            b = b[b.index(c) :]
+        else:
+            return False
+    return True
+
+
+class MockResponse:
+    """Mock response for aiohttp requests."""
+
+    def __init__(self, *, status=200, text=""):
+        """Initialize mock response."""
+        self.status = status
+        self._text = text
+
+    def update_text(self, text: str):
+        """Update the text of the response."""
+        self._text = text
+
+    async def read(self):
+        """Read the response body."""
+        return self._text.encode("utf-8")
+
+    async def text(self) -> str:
+        """Return the response body as text."""
+        return self._text
+
+    async def __aenter__(self):
+        """Enter the context manager."""
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        """Exit the context manager."""
+
+
+class AsyncIterator:
+    """Make list/fixture into async iterator for test mocks."""
+
+    def __init__(self, seq: Sequence[Any]) -> None:
+        """Initialize with sequence."""
+        self.iter = iter(seq)
+
+    def __aiter__(self) -> Self:
+        """Implement aiter."""
+        return self
+
+    async def __anext__(self) -> Any:
+        """Return next in sequence."""
+        try:
+            return next(self.iter)
+        except StopIteration:
+            raise StopAsyncIteration() from None

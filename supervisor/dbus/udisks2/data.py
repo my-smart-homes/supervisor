@@ -1,7 +1,6 @@
 """Data for UDisks2."""
 
 from dataclasses import dataclass
-from inspect import get_annotations
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
@@ -10,7 +9,7 @@ from dbus_fast import Variant
 from .const import EncryptType, EraseMode
 
 
-def udisks2_bytes_to_path(path_bytes: bytearray) -> Path:
+def udisks2_bytes_to_path(path_bytes: bytes) -> Path:
     """Convert bytes to path object without null character on end."""
     if path_bytes and path_bytes[-1] == 0:
         return Path(path_bytes[:-1].decode())
@@ -23,47 +22,14 @@ def _optional_variant(signature: str, value: Any | None) -> Variant | None:
     return Variant(signature, value) if value is not None else None
 
 
-UDisks2StandardOptionsDataType = TypedDict(
-    "UDisks2StandardOptionsDataType",
-    {"auth.no_user_interaction": NotRequired[bool]},
-)
-
-
-@dataclass(slots=True)
-class UDisks2StandardOptions:
-    """UDisks2 standard options.
-
-    http://storaged.org/doc/udisks2-api/latest/udisks-std-options.html
-    """
-
-    auth_no_user_interaction: bool | None = None
-
-    @staticmethod
-    def from_dict(data: UDisks2StandardOptionsDataType) -> "UDisks2StandardOptions":
-        """Create UDisks2StandardOptions from dict."""
-        return UDisks2StandardOptions(
-            auth_no_user_interaction=data.get("auth.no_user_interaction"),
-        )
-
-    def to_dict(self) -> dict[str, Variant]:
-        """Return dict representation."""
-        data = {
-            "auth.no_user_interaction": _optional_variant(
-                "b", self.auth_no_user_interaction
-            ),
-        }
-        return {k: v for k, v in data.items() if v}
-
-
-_udisks2_standard_options_annotations = get_annotations(UDisks2StandardOptionsDataType)
-
-
 class DeviceSpecificationDataType(TypedDict, total=False):
     """Device specification data type."""
 
     path: str
     label: str
     uuid: str
+    partuuid: str
+    partlabel: str
 
 
 @dataclass(slots=True)
@@ -76,14 +42,18 @@ class DeviceSpecification:
     path: Path | None = None
     label: str | None = None
     uuid: str | None = None
+    partuuid: str | None = None
+    partlabel: str | None = None
 
     @staticmethod
     def from_dict(data: DeviceSpecificationDataType) -> "DeviceSpecification":
         """Create DeviceSpecification from dict."""
         return DeviceSpecification(
-            path=Path(data.get("path")),
+            path=Path(data["path"]) if "path" in data else None,
             label=data.get("label"),
             uuid=data.get("uuid"),
+            partuuid=data.get("partuuid"),
+            partlabel=data.get("partlabel"),
         )
 
     def to_dict(self) -> dict[str, Variant]:
@@ -92,6 +62,8 @@ class DeviceSpecification:
             "path": Variant("s", self.path.as_posix()) if self.path else None,
             "label": _optional_variant("s", self.label),
             "uuid": _optional_variant("s", self.uuid),
+            "partuuid": _optional_variant("s", self.partuuid),
+            "partlabel": _optional_variant("s", self.partlabel),
         }
         return {k: v for k, v in data.items() if v}
 
@@ -101,7 +73,7 @@ FormatOptionsDataType = TypedDict(
     {
         "label": NotRequired[str],
         "take-ownership": NotRequired[bool],
-        "encrypt.passphrase": NotRequired[bytearray],
+        "encrypt.passphrase": NotRequired[bytes],
         "encrypt.type": NotRequired[str],
         "erase": NotRequired[str],
         "update-partition-type": NotRequired[bool],
@@ -109,13 +81,14 @@ FormatOptionsDataType = TypedDict(
         "dry-run-first": NotRequired[bool],
         "no-discard": NotRequired[bool],
         "tear-down": NotRequired[bool],
-    }
-    | _udisks2_standard_options_annotations,
+        # UDisks2 standard options
+        "auth.no_user_interaction": NotRequired[bool],
+    },
 )
 
 
 @dataclass(slots=True)
-class FormatOptions(UDisks2StandardOptions):
+class FormatOptions:
     """Options for formatting a block device.
 
     http://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Block.html#gdbus-method-org-freedesktop-UDisks2-Block.Format
@@ -131,6 +104,8 @@ class FormatOptions(UDisks2StandardOptions):
     dry_run_first: bool | None = None
     no_discard: bool | None = None
     tear_down: bool | None = None
+    # UDisks2 standard options
+    auth_no_user_interaction: bool | None = None
 
     @staticmethod
     def from_dict(data: FormatOptionsDataType) -> "FormatOptions":
@@ -146,7 +121,7 @@ class FormatOptions(UDisks2StandardOptions):
             encrypt_type=EncryptType(data["encrypt.type"])
             if "encrypt.type" in data
             else None,
-            erase=EncryptType(data["erase"]) if "erase" in data else None,
+            erase=EraseMode(data["erase"]) if "erase" in data else None,
             update_partition_type=data.get("update-partition-type"),
             no_block=data.get("no-block"),
             dry_run_first=data.get("dry-run-first"),
@@ -188,13 +163,14 @@ MountOptionsDataType = TypedDict(
     {
         "fstype": NotRequired[str],
         "options": NotRequired[str],
-    }
-    | _udisks2_standard_options_annotations,
+        # UDisks2 standard options
+        "auth.no_user_interaction": NotRequired[bool],
+    },
 )
 
 
 @dataclass(slots=True)
-class MountOptions(UDisks2StandardOptions):
+class MountOptions:
     """Filesystem mount options.
 
     http://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Filesystem.html#gdbus-method-org-freedesktop-UDisks2-Filesystem.Mount
@@ -202,6 +178,8 @@ class MountOptions(UDisks2StandardOptions):
 
     fstype: str | None = None
     options: list[str] | None = None
+    # UDisks2 standard options
+    auth_no_user_interaction: bool | None = None
 
     @staticmethod
     def from_dict(data: MountOptionsDataType) -> "MountOptions":
@@ -227,22 +205,25 @@ class MountOptions(UDisks2StandardOptions):
 
 
 UnmountOptionsDataType = TypedDict(
-    "UnountOptionsDataType",
+    "UnmountOptionsDataType",
     {
         "force": NotRequired[bool],
-    }
-    | _udisks2_standard_options_annotations,
+        # UDisks2 standard options
+        "auth.no_user_interaction": NotRequired[bool],
+    },
 )
 
 
 @dataclass(slots=True)
-class UnmountOptions(UDisks2StandardOptions):
+class UnmountOptions:
     """Filesystem unmount options.
 
     http://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Filesystem.html#gdbus-method-org-freedesktop-UDisks2-Filesystem.Unmount
     """
 
     force: bool | None = None
+    # UDisks2 standard options
+    auth_no_user_interaction: bool | None = None
 
     @staticmethod
     def from_dict(data: UnmountOptionsDataType) -> "UnmountOptions":
@@ -267,18 +248,24 @@ class UnmountOptions(UDisks2StandardOptions):
 
 CreatePartitionOptionsDataType = TypedDict(
     "CreatePartitionOptionsDataType",
-    {"partition-type": NotRequired[str]} | _udisks2_standard_options_annotations,
+    {
+        "partition-type": NotRequired[str],
+        # UDisks2 standard options
+        "auth.no_user_interaction": NotRequired[bool],
+    },
 )
 
 
 @dataclass(slots=True)
-class CreatePartitionOptions(UDisks2StandardOptions):
+class CreatePartitionOptions:
     """Create partition options.
 
     http://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.PartitionTable.html#gdbus-method-org-freedesktop-UDisks2-PartitionTable.CreatePartition
     """
 
     partition_type: str | None = None
+    # UDisks2 standard options
+    auth_no_user_interaction: bool | None = None
 
     @staticmethod
     def from_dict(data: CreatePartitionOptionsDataType) -> "CreatePartitionOptions":
@@ -303,18 +290,24 @@ class CreatePartitionOptions(UDisks2StandardOptions):
 
 DeletePartitionOptionsDataType = TypedDict(
     "DeletePartitionOptionsDataType",
-    {"tear-down": NotRequired[bool]} | _udisks2_standard_options_annotations,
+    {
+        "tear-down": NotRequired[bool],
+        # UDisks2 standard options
+        "auth.no_user_interaction": NotRequired[bool],
+    },
 )
 
 
 @dataclass(slots=True)
-class DeletePartitionOptions(UDisks2StandardOptions):
+class DeletePartitionOptions:
     """Delete partition options.
 
     http://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Partition.html#gdbus-method-org-freedesktop-UDisks2-Partition.Delete
     """
 
     tear_down: bool | None = None
+    # UDisks2 standard options
+    auth_no_user_interaction: bool | None = None
 
     @staticmethod
     def from_dict(data: DeletePartitionOptionsDataType) -> "DeletePartitionOptions":

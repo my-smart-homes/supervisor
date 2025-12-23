@@ -22,10 +22,12 @@ class NetworkManager(DBusServiceMock):
     interface = "org.freedesktop.NetworkManager"
     object_path = "/org/freedesktop/NetworkManager"
     version = "1.22.10"
+    connectivity_check_enabled = True
     connectivity = 4
     devices = [
         "/org/freedesktop/NetworkManager/Devices/1",
         "/org/freedesktop/NetworkManager/Devices/3",
+        "/org/freedesktop/NetworkManager/Devices/38",
     ]
 
     @dbus_property(access=PropertyAccess.READ)
@@ -40,6 +42,7 @@ class NetworkManager(DBusServiceMock):
             "/org/freedesktop/NetworkManager/Devices/1",
             "/org/freedesktop/NetworkManager/Devices/2",
             "/org/freedesktop/NetworkManager/Devices/3",
+            "/org/freedesktop/NetworkManager/Devices/38",
         ]
 
     @dbus_property(access=PropertyAccess.READ)
@@ -100,7 +103,10 @@ class NetworkManager(DBusServiceMock):
     @dbus_property(access=PropertyAccess.READ)
     def ActiveConnections(self) -> "ao":
         """Get ActiveConnections."""
-        return ["/org/freedesktop/NetworkManager/ActiveConnection/1"]
+        return [
+            "/org/freedesktop/NetworkManager/ActiveConnection/1",
+            "/org/freedesktop/NetworkManager/ActiveConnection/38",
+        ]
 
     @dbus_property(access=PropertyAccess.READ)
     def PrimaryConnection(self) -> "o":
@@ -155,7 +161,7 @@ class NetworkManager(DBusServiceMock):
     @dbus_property()
     def ConnectivityCheckEnabled(self) -> "b":
         """Get ConnectivityCheckEnabled."""
-        return True
+        return self.connectivity_check_enabled
 
     @ConnectivityCheckEnabled.setter
     def ConnectivityCheckEnabled(self, value: "b"):

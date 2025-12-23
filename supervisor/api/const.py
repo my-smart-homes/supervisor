@@ -12,6 +12,7 @@ CONTENT_TYPE_X_LOG = "text/x-log"
 
 COOKIE_INGRESS = "ingress_session"
 
+ATTR_ADDITIONAL_LOCATIONS = "additional_locations"
 ATTR_AGENT_VERSION = "agent_version"
 ATTR_APPARMOR_VERSION = "apparmor_version"
 ATTR_ATTRIBUTES = "attributes"
@@ -42,11 +43,13 @@ ATTR_GROUP_IDS = "group_ids"
 ATTR_IDENTIFIERS = "identifiers"
 ATTR_IS_ACTIVE = "is_active"
 ATTR_IS_OWNER = "is_owner"
-ATTR_JOB_ID = "job_id"
 ATTR_JOBS = "jobs"
 ATTR_LLMNR = "llmnr"
 ATTR_LLMNR_HOSTNAME = "llmnr_hostname"
 ATTR_LOCAL_ONLY = "local_only"
+ATTR_LOCATION_ATTRIBUTES = "location_attributes"
+ATTR_LOCATIONS = "locations"
+ATTR_MAX_DEPTH = "max_depth"
 ATTR_MDNS = "mdns"
 ATTR_MODEL = "model"
 ATTR_MOUNTS = "mounts"
@@ -68,6 +71,7 @@ ATTR_UPDATE_TYPE = "update_type"
 ATTR_USAGE = "usage"
 ATTR_USE_NTP = "use_ntp"
 ATTR_USERS = "users"
+ATTR_USER_PATH = "user_path"
 ATTR_VENDOR = "vendor"
 ATTR_VIRTUALIZATION = "virtualization"
 
@@ -77,3 +81,11 @@ class BootSlot(StrEnum):
 
     A = "A"
     B = "B"
+
+
+class DetectBlockingIO(StrEnum):
+    """Enable/Disable detection for blocking I/O in event loop."""
+
+    OFF = "off"
+    ON = "on"
+    ON_AT_STARTUP = "on-at-startup"

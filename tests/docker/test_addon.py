@@ -1,23 +1,36 @@
 """Test docker addon setup."""
 
+import asyncio
+from http import HTTPStatus
 from ipaddress import IPv4Address
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
-from docker.errors import NotFound
-from docker.types import Mount
+import aiodocker
 import pytest
 
 from supervisor.addons import validate as vd
 from supervisor.addons.addon import Addon
 from supervisor.addons.model import Data
 from supervisor.addons.options import AddonOptions
+from supervisor.const import BusEvent
 from supervisor.coresys import CoreSys
+from supervisor.dbus.agent.cgroup import CGroup
 from supervisor.docker.addon import DockerAddon
+from supervisor.docker.const import (
+    DockerMount,
+    MountBindOptions,
+    MountType,
+    PropagationMode,
+)
+from supervisor.docker.manager import DockerAPI
 from supervisor.exceptions import CoreDNSError, DockerNotFound
+from supervisor.hardware.data import Device
+from supervisor.os.manager import OSManager
 from supervisor.plugins.dns import PluginDns
-from supervisor.resolution.const import ContextType, IssueType
-from supervisor.resolution.data import Issue
+from supervisor.resolution.const import ContextType, IssueType, SuggestionType
+from supervisor.resolution.data import Issue, Suggestion
 
 from ..common import load_json_fixture
 from . import DEV_MOUNT
@@ -73,8 +86,8 @@ def test_base_volumes_included(
 
     # Data added as rw
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=docker_addon.addon.path_extern_data.as_posix(),
             target="/data",
             read_only=False,
@@ -92,8 +105,8 @@ def test_addon_map_folder_defaults(
     )
     # Config added and is marked rw
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=coresys.config.path_extern_homeassistant.as_posix(),
             target="/config",
             read_only=False,
@@ -103,8 +116,8 @@ def test_addon_map_folder_defaults(
 
     # SSL added and defaults to ro
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=coresys.config.path_extern_ssl.as_posix(),
             target="/ssl",
             read_only=True,
@@ -114,30 +127,30 @@ def test_addon_map_folder_defaults(
 
     # Media added and propagation set
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=coresys.config.path_extern_media.as_posix(),
             target="/media",
             read_only=True,
-            propagation="rslave",
+            bind_options=MountBindOptions(propagation=PropagationMode.RSLAVE),
         )
         in docker_addon.mounts
     )
 
     # Share added and propagation set
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=coresys.config.path_extern_share.as_posix(),
             target="/share",
             read_only=True,
-            propagation="rslave",
+            bind_options=MountBindOptions(propagation=PropagationMode.RSLAVE),
         )
         in docker_addon.mounts
     )
 
     # Backup not added
-    assert "/backup" not in [mount["Target"] for mount in docker_addon.mounts]
+    assert "/backup" not in [mount.target for mount in docker_addon.mounts]
 
 
 def test_addon_map_homeassistant_folder(
@@ -150,8 +163,8 @@ def test_addon_map_homeassistant_folder(
 
     # Home Assistant config folder mounted to /homeassistant, not /config
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=coresys.config.path_extern_homeassistant.as_posix(),
             target="/homeassistant",
             read_only=True,
@@ -170,8 +183,8 @@ def test_addon_map_addon_configs_folder(
 
     # Addon configs folder included
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=coresys.config.path_extern_addon_configs.as_posix(),
             target="/addon_configs",
             read_only=True,
@@ -190,8 +203,8 @@ def test_addon_map_addon_config_folder(
 
     # Addon config folder included
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=docker_addon.addon.path_extern_config.as_posix(),
             target="/config",
             read_only=True,
@@ -213,8 +226,8 @@ def test_addon_map_addon_config_folder_with_custom_target(
 
     # Addon config folder included
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=docker_addon.addon.path_extern_config.as_posix(),
             target="/custom/target/path",
             read_only=False,
@@ -233,8 +246,8 @@ def test_addon_map_data_folder_with_custom_target(
 
     # Addon config folder included
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=docker_addon.addon.path_extern_data.as_posix(),
             target="/custom/data/path",
             read_only=False,
@@ -253,8 +266,8 @@ def test_addon_ignore_on_config_map(
 
     # Config added and is marked rw
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source=coresys.config.path_extern_homeassistant.as_posix(),
             target="/config",
             read_only=False,
@@ -264,11 +277,10 @@ def test_addon_ignore_on_config_map(
 
     # Mount for addon's specific config folder omitted since config in map field
     assert (
-        len([mount for mount in docker_addon.mounts if mount["Target"] == "/config"])
-        == 1
+        len([mount for mount in docker_addon.mounts if mount.target == "/config"]) == 1
     )
     # Home Assistant mount omitted since config in map field
-    assert "/homeassistant" not in [mount["Target"] for mount in docker_addon.mounts]
+    assert "/homeassistant" not in [mount.target for mount in docker_addon.mounts]
 
 
 def test_journald_addon(
@@ -280,8 +292,8 @@ def test_journald_addon(
     )
 
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source="/var/log/journal",
             target="/var/log/journal",
             read_only=True,
@@ -289,8 +301,8 @@ def test_journald_addon(
         in docker_addon.mounts
     )
     assert (
-        Mount(
-            type="bind",
+        DockerMount(
+            type=MountType.BIND,
             source="/run/log/journal",
             target="/run/log/journal",
             read_only=True,
@@ -307,15 +319,20 @@ def test_not_journald_addon(
         coresys, addonsdata_system, "basic-addon-config.json"
     )
 
-    assert "/var/log/journal" not in [mount["Target"] for mount in docker_addon.mounts]
+    assert "/var/log/journal" not in [mount.target for mount in docker_addon.mounts]
 
 
 async def test_addon_run_docker_error(
-    coresys: CoreSys, addonsdata_system: dict[str, Data], path_extern
+    coresys: CoreSys,
+    addonsdata_system: dict[str, Data],
+    path_extern,
+    tmp_supervisor_data: Path,
 ):
     """Test docker error when addon is run."""
     await coresys.dbus.timedate.connect(coresys.dbus.bus)
-    coresys.docker.containers.create.side_effect = NotFound("Missing")
+    coresys.docker.containers.create.side_effect = aiodocker.DockerError(
+        HTTPStatus.NOT_FOUND, {"message": "missing"}
+    )
     docker_addon = get_docker_addon(
         coresys, addonsdata_system, "basic-addon-config.json"
     )
@@ -340,6 +357,7 @@ async def test_addon_run_add_host_error(
     addonsdata_system: dict[str, Data],
     capture_exception: Mock,
     path_extern,
+    tmp_supervisor_data: Path,
 ):
     """Test error adding host when addon is run."""
     await coresys.dbus.timedate.connect(coresys.dbus.bus)
@@ -380,3 +398,205 @@ async def test_addon_stop_delete_host_error(
         await docker_addon.stop()
 
         capture_exception.assert_called_once_with(err)
+
+
+TEST_DEV_PATH = "/dev/ttyAMA0"
+TEST_SYSFS_PATH = "/sys/devices/platform/soc/ffe09000.usb/ff500000.usb/xhci-hcd.0.auto/usb1/1-1/1-1.1/1-1.1:1.0/tty/ttyACM0"
+TEST_HW_DEVICE = Device(
+    name="ttyACM0",
+    path=Path("/dev/ttyAMA0"),
+    sysfs=Path(
+        "/sys/devices/platform/soc/ffe09000.usb/ff500000.usb/xhci-hcd.0.auto/usb1/1-1/1-1.1/1-1.1:1.0/tty/ttyACM0"
+    ),
+    subsystem="tty",
+    parent=Path(
+        "/sys/devices/platform/soc/ffe09000.usb/ff500000.usb/xhci-hcd.0.auto/usb1/1-1/1-1.1/1-1.1:1.0"
+    ),
+    links=[
+        Path(
+            "/dev/serial/by-id/usb-Texas_Instruments_TI_CC2531_USB_CDC___0X0123456789ABCDEF-if00"
+        ),
+        Path("/dev/serial/by-path/platform-xhci-hcd.0.auto-usb-0:1.1:1.0"),
+        Path("/dev/serial/by-path/platform-xhci-hcd.0.auto-usbv2-0:1.1:1.0"),
+    ],
+    attributes={},
+    children=[],
+)
+
+
+@pytest.mark.usefixtures("path_extern")
+@pytest.mark.parametrize(
+    ("dev_path", "cgroup", "is_os"),
+    [
+        (TEST_DEV_PATH, "1", True),
+        (TEST_SYSFS_PATH, "1", True),
+        (TEST_DEV_PATH, "1", False),
+        (TEST_SYSFS_PATH, "1", False),
+        (TEST_DEV_PATH, "2", True),
+        (TEST_SYSFS_PATH, "2", True),
+    ],
+)
+async def test_addon_new_device(
+    coresys: CoreSys,
+    install_addon_ssh: Addon,
+    container: MagicMock,
+    docker: DockerAPI,
+    dev_path: str,
+    cgroup: str,
+    is_os: bool,
+    tmp_supervisor_data: Path,
+):
+    """Test new device that is listed in static devices."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_addon_ssh.data["devices"] = [dev_path]
+    container.id = 123
+    docker.info.cgroup = cgroup
+
+    with (
+        patch.object(Addon, "write_options"),
+        patch.object(OSManager, "available", new=PropertyMock(return_value=is_os)),
+        patch.object(CGroup, "add_devices_allowed") as add_devices,
+    ):
+        await install_addon_ssh.start()
+
+        coresys.bus.fire_event(
+            BusEvent.HARDWARE_NEW_DEVICE,
+            TEST_HW_DEVICE,
+        )
+        await asyncio.sleep(0.01)
+
+        add_devices.assert_called_once_with(123, "c 0:0 rwm")
+
+
+@pytest.mark.usefixtures("path_extern")
+@pytest.mark.parametrize("dev_path", [TEST_DEV_PATH, TEST_SYSFS_PATH])
+async def test_addon_new_device_no_haos(
+    coresys: CoreSys,
+    install_addon_ssh: Addon,
+    docker: DockerAPI,
+    dev_path: str,
+    tmp_supervisor_data: Path,
+):
+    """Test new device that is listed in static devices on non HAOS system with CGroup V2."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_addon_ssh.data["devices"] = [dev_path]
+    docker.info.cgroup = "2"
+
+    with (
+        patch.object(Addon, "write_options"),
+        patch.object(OSManager, "available", new=PropertyMock(return_value=False)),
+        patch.object(CGroup, "add_devices_allowed") as add_devices,
+    ):
+        await install_addon_ssh.start()
+
+        coresys.bus.fire_event(
+            BusEvent.HARDWARE_NEW_DEVICE,
+            TEST_HW_DEVICE,
+        )
+        await asyncio.sleep(0.01)
+
+        add_devices.assert_not_called()
+
+    # Issue added with hardware event since access cannot be added dynamically
+    assert install_addon_ssh.device_access_missing_issue in coresys.resolution.issues
+    assert (
+        Suggestion(
+            SuggestionType.EXECUTE_RESTART, ContextType.ADDON, reference="local_ssh"
+        )
+        in coresys.resolution.suggestions
+    )
+
+    # Stopping and removing the container clears it as access granted on next start
+    await install_addon_ssh.stop()
+    assert coresys.resolution.issues == []
+    assert coresys.resolution.suggestions == []
+
+
+async def test_ulimits_integration(
+    coresys: CoreSys,
+    install_addon_ssh: Addon,
+):
+    """Test ulimits integration with Docker addon."""
+    docker_addon = DockerAddon(coresys, install_addon_ssh)
+
+    # Test default case (no ulimits, no realtime)
+    assert docker_addon.ulimits is None
+
+    # Test with realtime enabled (should have built-in ulimits)
+    install_addon_ssh.data["realtime"] = True
+    ulimits = docker_addon.ulimits
+    assert ulimits is not None
+    assert len(ulimits) == 2
+    # Check for rtprio limit
+    rtprio_limit = next((u for u in ulimits if u.name == "rtprio"), None)
+    assert rtprio_limit is not None
+    assert rtprio_limit.soft == 90
+    assert rtprio_limit.hard == 99
+    # Check for memlock limit
+    memlock_limit = next((u for u in ulimits if u.name == "memlock"), None)
+    assert memlock_limit is not None
+    assert memlock_limit.soft == 128 * 1024 * 1024
+    assert memlock_limit.hard == 128 * 1024 * 1024
+
+    # Test with configurable ulimits (simple format)
+    install_addon_ssh.data["realtime"] = False
+    install_addon_ssh.data["ulimits"] = {"nofile": 65535, "nproc": 32768}
+    ulimits = docker_addon.ulimits
+    assert ulimits is not None
+    assert len(ulimits) == 2
+
+    nofile_limit = next((u for u in ulimits if u.name == "nofile"), None)
+    assert nofile_limit is not None
+    assert nofile_limit.soft == 65535
+    assert nofile_limit.hard == 65535
+
+    nproc_limit = next((u for u in ulimits if u.name == "nproc"), None)
+    assert nproc_limit is not None
+    assert nproc_limit.soft == 32768
+    assert nproc_limit.hard == 32768
+
+    # Test with configurable ulimits (detailed format)
+    install_addon_ssh.data["ulimits"] = {
+        "nofile": {"soft": 20000, "hard": 40000},
+        "memlock": {"soft": 67108864, "hard": 134217728},
+    }
+    ulimits = docker_addon.ulimits
+    assert ulimits is not None
+    assert len(ulimits) == 2
+
+    nofile_limit = next((u for u in ulimits if u.name == "nofile"), None)
+    assert nofile_limit is not None
+    assert nofile_limit.soft == 20000
+    assert nofile_limit.hard == 40000
+
+    memlock_limit = next((u for u in ulimits if u.name == "memlock"), None)
+    assert memlock_limit is not None
+    assert memlock_limit.soft == 67108864
+    assert memlock_limit.hard == 134217728
+
+    # Test mixed format and realtime (realtime + custom ulimits)
+    install_addon_ssh.data["realtime"] = True
+    install_addon_ssh.data["ulimits"] = {
+        "nofile": 65535,
+        "core": {"soft": 0, "hard": 0},  # Disable core dumps
+    }
+    ulimits = docker_addon.ulimits
+    assert ulimits is not None
+    assert (
+        len(ulimits) == 4
+    )  # rtprio, memlock (from realtime) + nofile, core (from config)
+
+    # Check realtime limits still present
+    rtprio_limit = next((u for u in ulimits if u.name == "rtprio"), None)
+    assert rtprio_limit is not None
+
+    # Check custom limits added
+    nofile_limit = next((u for u in ulimits if u.name == "nofile"), None)
+    assert nofile_limit is not None
+    assert nofile_limit.soft == 65535
+    assert nofile_limit.hard == 65535
+
+    core_limit = next((u for u in ulimits if u.name == "core"), None)
+    assert core_limit is not None
+    assert core_limit.soft == 0
+    assert core_limit.hard == 0

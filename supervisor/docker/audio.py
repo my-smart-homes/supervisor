@@ -2,14 +2,11 @@
 
 import logging
 
-import docker
-from docker.types import Mount
-
-from ..const import DOCKER_CPU_RUNTIME_ALLOCATION, MACHINE_ID
+from ..const import DOCKER_CPU_RUNTIME_ALLOCATION
 from ..coresys import CoreSysAttributes
 from ..exceptions import DockerJobError
 from ..hardware.const import PolicyGroup
-from ..jobs.const import JobExecutionLimit
+from ..jobs.const import JobConcurrency
 from ..jobs.decorator import Job
 from .const import (
     ENV_TIME,
@@ -17,8 +14,11 @@ from .const import (
     MOUNT_DEV,
     MOUNT_MACHINE_ID,
     MOUNT_UDEV,
+    PATH_PRIVATE_DATA,
     Capabilities,
+    DockerMount,
     MountType,
+    Ulimit,
 )
 from .interface import DockerInterface
 
@@ -41,14 +41,14 @@ class DockerAudio(DockerInterface, CoreSysAttributes):
         return AUDIO_DOCKER_NAME
 
     @property
-    def mounts(self) -> list[Mount]:
+    def mounts(self) -> list[DockerMount]:
         """Return mounts for container."""
         mounts = [
             MOUNT_DEV,
-            Mount(
+            DockerMount(
                 type=MountType.BIND,
                 source=self.sys_config.path_extern_audio.as_posix(),
-                target="/data",
+                target=PATH_PRIVATE_DATA.as_posix(),
                 read_only=False,
             ),
             MOUNT_DBUS,
@@ -56,7 +56,7 @@ class DockerAudio(DockerInterface, CoreSysAttributes):
         ]
 
         # Machine ID
-        if MACHINE_ID.exists():
+        if self.sys_machine_id:
             mounts.append(MOUNT_MACHINE_ID)
 
         return mounts
@@ -74,10 +74,10 @@ class DockerAudio(DockerInterface, CoreSysAttributes):
         return [Capabilities.SYS_NICE, Capabilities.SYS_RESOURCE]
 
     @property
-    def ulimits(self) -> list[docker.types.Ulimit]:
+    def ulimits(self) -> list[Ulimit]:
         """Generate ulimits for audio."""
         # Pulseaudio by default tries to use real-time scheduling with priority of 5.
-        return [docker.types.Ulimit(name="rtprio", soft=10, hard=10)]
+        return [Ulimit(name="rtprio", soft=10, hard=10)]
 
     @property
     def cpu_rt_runtime(self) -> int | None:
@@ -88,8 +88,8 @@ class DockerAudio(DockerInterface, CoreSysAttributes):
 
     @Job(
         name="docker_audio_run",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def run(self) -> None:
         """Run Docker image."""

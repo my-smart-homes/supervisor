@@ -16,8 +16,8 @@ from ..const import (
     DBUS_IFACE_CONNECTION_ACTIVE,
     DBUS_NAME_NM,
     DBUS_OBJECT_BASE,
+    ConnectionState,
     ConnectionStateFlags,
-    ConnectionStateType,
 )
 from ..interface import DBusInterfaceProxy, dbus_property
 from ..utils import dbus_connected
@@ -27,7 +27,7 @@ from .ip_configuration import IpConfiguration
 class NetworkConnection(DBusInterfaceProxy):
     """Active network connection object for Network Manager.
 
-    https://developer.gnome.org/NetworkManager/stable/gdbus-org.freedesktop.NetworkManager.Connection.Active.html
+    https://networkmanager.dev/docs/api/latest/gdbus-org.freedesktop.NetworkManager.Connection.Active.html
     """
 
     bus_name: str = DBUS_NAME_NM
@@ -35,14 +35,17 @@ class NetworkConnection(DBusInterfaceProxy):
 
     def __init__(self, object_path: str) -> None:
         """Initialize NetworkConnection object."""
-        super().__init__()
-
-        self.object_path: str = object_path
-
+        self._object_path: str = object_path
         self._ipv4: IpConfiguration | None = None
         self._ipv6: IpConfiguration | None = None
         self._state_flags: set[ConnectionStateFlags] = {ConnectionStateFlags.NONE}
         self._settings: NetworkSetting | None = None
+        super().__init__()
+
+    @property
+    def object_path(self) -> str:
+        """Object path for dbus object."""
+        return self._object_path
 
     @property
     @dbus_property
@@ -64,9 +67,9 @@ class NetworkConnection(DBusInterfaceProxy):
 
     @property
     @dbus_property
-    def state(self) -> ConnectionStateType:
+    def state(self) -> ConnectionState:
         """Return the state of the connection."""
-        return self.properties[DBUS_ATTR_STATE]
+        return ConnectionState(self.properties[DBUS_ATTR_STATE])
 
     @property
     def state_flags(self) -> set[ConnectionStateFlags]:
@@ -93,7 +96,7 @@ class NetworkConnection(DBusInterfaceProxy):
 
     @ipv4.setter
     def ipv4(self, ipv4: IpConfiguration | None) -> None:
-        """Set ipv4 configuration."""
+        """Set IPv4 configuration."""
         if self._ipv4 and self._ipv4 is not ipv4:
             self._ipv4.shutdown()
 
@@ -106,7 +109,7 @@ class NetworkConnection(DBusInterfaceProxy):
 
     @ipv6.setter
     def ipv6(self, ipv6: IpConfiguration | None) -> None:
-        """Set ipv6 configuration."""
+        """Set IPv6 configuration."""
         if self._ipv6 and self._ipv6 is not ipv6:
             self._ipv6.shutdown()
 
@@ -134,7 +137,7 @@ class NetworkConnection(DBusInterfaceProxy):
                 await self.ipv4.update()
             elif self.properties[DBUS_ATTR_IP4CONFIG] != DBUS_OBJECT_BASE:
                 self.ipv4 = IpConfiguration(self.properties[DBUS_ATTR_IP4CONFIG])
-                await self.ipv4.connect(self.dbus.bus)
+                await self.ipv4.connect(self.connected_dbus.bus)
             else:
                 self.ipv4 = None
 
@@ -148,7 +151,7 @@ class NetworkConnection(DBusInterfaceProxy):
                 await self.ipv6.update()
             elif self.properties[DBUS_ATTR_IP6CONFIG] != DBUS_OBJECT_BASE:
                 self.ipv6 = IpConfiguration(self.properties[DBUS_ATTR_IP6CONFIG], False)
-                await self.ipv6.connect(self.dbus.bus)
+                await self.ipv6.connect(self.connected_dbus.bus)
             else:
                 self.ipv6 = None
 
@@ -162,7 +165,7 @@ class NetworkConnection(DBusInterfaceProxy):
                 await self.settings.reload()
             elif self.properties[DBUS_ATTR_CONNECTION] != DBUS_OBJECT_BASE:
                 self.settings = NetworkSetting(self.properties[DBUS_ATTR_CONNECTION])
-                await self.settings.connect(self.dbus.bus)
+                await self.settings.connect(self.connected_dbus.bus)
             else:
                 self.settings = None
 

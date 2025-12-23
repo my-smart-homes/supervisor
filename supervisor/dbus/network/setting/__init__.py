@@ -6,14 +6,15 @@ from typing import Any
 from dbus_fast import Variant
 from dbus_fast.aio.message_bus import MessageBus
 
-from ...const import DBUS_NAME_NM
+from ...const import DBUS_NAME_NM, MulticastDnsValue
 from ...interface import DBusInterface
 from ...utils import dbus_connected
 from ..configuration import (
     ConnectionProperties,
     EthernetProperties,
+    Ip4Properties,
+    Ip6Properties,
     IpAddress,
-    IpProperties,
     MatchProperties,
     VlanProperties,
     WirelessProperties,
@@ -58,6 +59,8 @@ CONF_ATTR_IPV4_GATEWAY = "gateway"
 CONF_ATTR_IPV4_DNS = "dns"
 
 CONF_ATTR_IPV6_METHOD = "method"
+CONF_ATTR_IPV6_ADDR_GEN_MODE = "addr-gen-mode"
+CONF_ATTR_IPV6_PRIVACY = "ip6-privacy"
 CONF_ATTR_IPV6_ADDRESS_DATA = "address-data"
 CONF_ATTR_IPV6_GATEWAY = "gateway"
 CONF_ATTR_IPV6_DNS = "dns"
@@ -69,6 +72,8 @@ IPV4_6_IGNORE_FIELDS = [
     "dns-data",
     "gateway",
     "method",
+    "addr-gen-mode",
+    "ip6-privacy",
 ]
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -79,7 +84,7 @@ def _merge_settings_attribute(
     new_settings: dict[str, dict[str, Variant]],
     attribute: str,
     *,
-    ignore_current_value: list[str] = None,
+    ignore_current_value: list[str] | None = None,
 ) -> None:
     """Merge settings attribute if present."""
     if attribute in new_settings:
@@ -103,16 +108,22 @@ class NetworkSetting(DBusInterface):
 
     def __init__(self, object_path: str) -> None:
         """Initialize NetworkConnection object."""
-        self.object_path: str = object_path
+        self._object_path: str = object_path
 
         self._connection: ConnectionProperties | None = None
         self._wireless: WirelessProperties | None = None
         self._wireless_security: WirelessSecurityProperties | None = None
         self._ethernet: EthernetProperties | None = None
         self._vlan: VlanProperties | None = None
-        self._ipv4: IpProperties | None = None
-        self._ipv6: IpProperties | None = None
+        self._ipv4: Ip4Properties | None = None
+        self._ipv6: Ip6Properties | None = None
         self._match: MatchProperties | None = None
+        super().__init__()
+
+    @property
+    def object_path(self) -> str:
+        """Object path for dbus object."""
+        return self._object_path
 
     @property
     def connection(self) -> ConnectionProperties | None:
@@ -140,13 +151,13 @@ class NetworkSetting(DBusInterface):
         return self._vlan
 
     @property
-    def ipv4(self) -> IpProperties | None:
-        """Return ipv4 properties if any."""
+    def ipv4(self) -> Ip4Properties | None:
+        """Return IPv4 properties if any."""
         return self._ipv4
 
     @property
-    def ipv6(self) -> IpProperties | None:
-        """Return ipv6 properties if any."""
+    def ipv6(self) -> Ip6Properties | None:
+        """Return IPv6 properties if any."""
         return self._ipv6
 
     @property
@@ -157,14 +168,16 @@ class NetworkSetting(DBusInterface):
     @dbus_connected
     async def get_settings(self) -> dict[str, Any]:
         """Return connection settings."""
-        return await self.dbus.Settings.Connection.call_get_settings()
+        return await self.connected_dbus.Settings.Connection.call("get_settings")
 
     @dbus_connected
     async def update(self, settings: dict[str, dict[str, Variant]]) -> None:
         """Update connection settings."""
         new_settings: dict[
             str, dict[str, Variant]
-        ] = await self.dbus.Settings.Connection.call_get_settings(unpack_variants=False)
+        ] = await self.connected_dbus.Settings.Connection.call(
+            "get_settings", unpack_variants=False
+        )
 
         _merge_settings_attribute(
             new_settings,
@@ -192,19 +205,19 @@ class NetworkSetting(DBusInterface):
         )
         _merge_settings_attribute(new_settings, settings, CONF_ATTR_MATCH)
 
-        await self.dbus.Settings.Connection.call_update(new_settings)
+        await self.connected_dbus.Settings.Connection.call("update", new_settings)
 
     @dbus_connected
     async def delete(self) -> None:
         """Delete connection settings."""
-        await self.dbus.Settings.Connection.call_delete()
+        await self.connected_dbus.Settings.Connection.call("delete")
 
     async def connect(self, bus: MessageBus) -> None:
         """Get connection information."""
         await super().connect(bus)
         await self.reload()
 
-        self.dbus.Settings.Connection.on_updated(self.reload)
+        self.connected_dbus.Settings.Connection.on("updated", self.reload)
 
     @dbus_connected
     async def reload(self):
@@ -212,69 +225,92 @@ class NetworkSetting(DBusInterface):
         data = await self.get_settings()
 
         # Get configuration settings we care about
-        # See: https://developer-old.gnome.org/NetworkManager/stable/ch01.html
+        # See: https://networkmanager.dev/docs/api/latest/nm-settings-dbus.html
         if CONF_ATTR_CONNECTION in data:
             self._connection = ConnectionProperties(
-                data[CONF_ATTR_CONNECTION].get(CONF_ATTR_CONNECTION_ID),
-                data[CONF_ATTR_CONNECTION].get(CONF_ATTR_CONNECTION_UUID),
-                data[CONF_ATTR_CONNECTION].get(CONF_ATTR_CONNECTION_TYPE),
-                data[CONF_ATTR_CONNECTION].get(CONF_ATTR_CONNECTION_INTERFACE_NAME),
+                id=data[CONF_ATTR_CONNECTION].get(CONF_ATTR_CONNECTION_ID),
+                uuid=data[CONF_ATTR_CONNECTION].get(CONF_ATTR_CONNECTION_UUID),
+                type=data[CONF_ATTR_CONNECTION].get(CONF_ATTR_CONNECTION_TYPE),
+                interface_name=data[CONF_ATTR_CONNECTION].get(
+                    CONF_ATTR_CONNECTION_INTERFACE_NAME
+                ),
+                mdns=data[CONF_ATTR_CONNECTION].get(
+                    CONF_ATTR_CONNECTION_MDNS, MulticastDnsValue.DEFAULT.value
+                ),
+                llmnr=data[CONF_ATTR_CONNECTION].get(
+                    CONF_ATTR_CONNECTION_LLMNR, MulticastDnsValue.DEFAULT.value
+                ),
             )
 
         if CONF_ATTR_802_ETHERNET in data:
             self._ethernet = EthernetProperties(
-                data[CONF_ATTR_802_ETHERNET].get(CONF_ATTR_802_ETHERNET_ASSIGNED_MAC),
+                assigned_mac=data[CONF_ATTR_802_ETHERNET].get(
+                    CONF_ATTR_802_ETHERNET_ASSIGNED_MAC
+                ),
             )
 
         if CONF_ATTR_802_WIRELESS in data:
             self._wireless = WirelessProperties(
-                bytes(
+                ssid=bytes(
                     data[CONF_ATTR_802_WIRELESS].get(CONF_ATTR_802_WIRELESS_SSID, [])
                 ).decode(),
-                data[CONF_ATTR_802_WIRELESS].get(CONF_ATTR_802_WIRELESS_ASSIGNED_MAC),
-                data[CONF_ATTR_802_WIRELESS].get(CONF_ATTR_802_WIRELESS_MODE),
-                data[CONF_ATTR_802_WIRELESS].get(CONF_ATTR_802_WIRELESS_POWERSAVE),
+                assigned_mac=data[CONF_ATTR_802_WIRELESS].get(
+                    CONF_ATTR_802_WIRELESS_ASSIGNED_MAC
+                ),
+                mode=data[CONF_ATTR_802_WIRELESS].get(CONF_ATTR_802_WIRELESS_MODE),
+                powersave=data[CONF_ATTR_802_WIRELESS].get(
+                    CONF_ATTR_802_WIRELESS_POWERSAVE
+                ),
             )
 
         if CONF_ATTR_802_WIRELESS_SECURITY in data:
             self._wireless_security = WirelessSecurityProperties(
-                data[CONF_ATTR_802_WIRELESS_SECURITY].get(
+                auth_alg=data[CONF_ATTR_802_WIRELESS_SECURITY].get(
                     CONF_ATTR_802_WIRELESS_SECURITY_AUTH_ALG
                 ),
-                data[CONF_ATTR_802_WIRELESS_SECURITY].get(
+                key_mgmt=data[CONF_ATTR_802_WIRELESS_SECURITY].get(
                     CONF_ATTR_802_WIRELESS_SECURITY_KEY_MGMT
                 ),
-                data[CONF_ATTR_802_WIRELESS_SECURITY].get(
+                psk=data[CONF_ATTR_802_WIRELESS_SECURITY].get(
                     CONF_ATTR_802_WIRELESS_SECURITY_PSK
                 ),
             )
 
         if CONF_ATTR_VLAN in data:
-            self._vlan = VlanProperties(
-                data[CONF_ATTR_VLAN].get(CONF_ATTR_VLAN_ID),
-                data[CONF_ATTR_VLAN].get(CONF_ATTR_VLAN_PARENT),
-            )
+            if CONF_ATTR_VLAN_ID in data[CONF_ATTR_VLAN]:
+                self._vlan = VlanProperties(
+                    id=data[CONF_ATTR_VLAN][CONF_ATTR_VLAN_ID],
+                    parent=data[CONF_ATTR_VLAN].get(CONF_ATTR_VLAN_PARENT),
+                )
+            else:
+                self._vlan = None
+                _LOGGER.warning(
+                    "Network settings for vlan connection %s missing required vlan id, cannot process it",
+                    self.connection.interface_name,
+                )
 
         if CONF_ATTR_IPV4 in data:
             address_data = None
             if ips := data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_ADDRESS_DATA):
                 address_data = [IpAddress(ip["address"], ip["prefix"]) for ip in ips]
-            self._ipv4 = IpProperties(
-                data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_METHOD),
-                address_data,
-                data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_GATEWAY),
-                data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_DNS),
+            self._ipv4 = Ip4Properties(
+                method=data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_METHOD),
+                address_data=address_data,
+                gateway=data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_GATEWAY),
+                dns=data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_DNS),
             )
 
         if CONF_ATTR_IPV6 in data:
             address_data = None
             if ips := data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_ADDRESS_DATA):
                 address_data = [IpAddress(ip["address"], ip["prefix"]) for ip in ips]
-            self._ipv6 = IpProperties(
-                data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_METHOD),
-                address_data,
-                data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_GATEWAY),
-                data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_DNS),
+            self._ipv6 = Ip6Properties(
+                method=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_METHOD),
+                addr_gen_mode=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_ADDR_GEN_MODE),
+                ip6_privacy=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_PRIVACY),
+                address_data=address_data,
+                gateway=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_GATEWAY),
+                dns=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_DNS),
             )
 
         if CONF_ATTR_MATCH in data:

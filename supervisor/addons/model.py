@@ -47,7 +47,7 @@ from ..const import (
     ATTR_JOURNALD,
     ATTR_KERNEL_MODULES,
     ATTR_LEGACY,
-    ATTR_LOCATON,
+    ATTR_LOCATION,
     ATTR_MACHINE,
     ATTR_MAP,
     ATTR_NAME,
@@ -72,6 +72,7 @@ from ..const import (
     ATTR_TYPE,
     ATTR_UART,
     ATTR_UDEV,
+    ATTR_ULIMITS,
     ATTR_URL,
     ATTR_USB,
     ATTR_VERSION,
@@ -86,10 +87,16 @@ from ..const import (
     AddonBootConfig,
     AddonStage,
     AddonStartup,
+    CpuArch,
 )
 from ..coresys import CoreSys
 from ..docker.const import Capabilities
-from ..exceptions import AddonsNotSupportedError
+from ..exceptions import (
+    AddonNotSupportedArchitectureError,
+    AddonNotSupportedError,
+    AddonNotSupportedHomeAssistantVersionError,
+    AddonNotSupportedMachineTypeError,
+)
 from ..jobs.const import JOB_GROUP_ADDON
 from ..jobs.job_group import JobGroup
 from ..utils import version_is_new_enough
@@ -97,7 +104,6 @@ from .configuration import FolderMapping
 from .const import (
     ATTR_BACKUP,
     ATTR_BREAKING_VERSIONS,
-    ATTR_CODENOTARY,
     ATTR_PATH,
     ATTR_READ_ONLY,
     AddonBackupMode,
@@ -211,18 +217,6 @@ class AddonModel(JobGroup, ABC):
         return self.data[ATTR_DESCRIPTON]
 
     @property
-    def long_description(self) -> str | None:
-        """Return README.md as long_description."""
-        readme = Path(self.path_location, "README.md")
-
-        # If readme not exists
-        if not readme.exists():
-            return None
-
-        # Return data
-        return readme.read_text(encoding="utf-8")
-
-    @property
     def repository(self) -> str:
         """Return repository of add-on."""
         return self.data[ATTR_REPOSITORY]
@@ -306,7 +300,7 @@ class AddonModel(JobGroup, ABC):
         return self.data.get(ATTR_WEBUI)
 
     @property
-    def watchdog(self) -> str | None:
+    def watchdog_url(self) -> str | None:
         """Return URL to for watchdog or None."""
         return self.data.get(ATTR_WATCHDOG)
 
@@ -322,12 +316,12 @@ class AddonModel(JobGroup, ABC):
 
     @property
     def panel_title(self) -> str:
-        """Return panel icon for Ingress frame."""
+        """Return panel title for Ingress frame."""
         return self.data.get(ATTR_PANEL_TITLE, self.name)
 
     @property
-    def panel_admin(self) -> str:
-        """Return panel icon for Ingress frame."""
+    def panel_admin(self) -> bool:
+        """Return if panel is only available for admin users."""
         return self.data[ATTR_PANEL_ADMIN]
 
     @property
@@ -470,6 +464,11 @@ class AddonModel(JobGroup, ABC):
         return self.data[ATTR_UDEV]
 
     @property
+    def ulimits(self) -> dict[str, Any]:
+        """Return ulimits configuration."""
+        return self.data[ATTR_ULIMITS]
+
+    @property
     def with_kernel_modules(self) -> bool:
         """Return True if the add-on access to kernel modules."""
         return self.data[ATTR_KERNEL_MODULES]
@@ -490,7 +489,7 @@ class AddonModel(JobGroup, ABC):
         return self.data[ATTR_DEVICETREE]
 
     @property
-    def with_tmpfs(self) -> str | None:
+    def with_tmpfs(self) -> bool:
         """Return if tmp is in memory of add-on."""
         return self.data[ATTR_TMPFS]
 
@@ -510,7 +509,7 @@ class AddonModel(JobGroup, ABC):
         return self.data[ATTR_VIDEO]
 
     @property
-    def homeassistant_version(self) -> str | None:
+    def homeassistant_version(self) -> AwesomeVersion | None:
         """Return min Home Assistant version they needed by Add-on."""
         return self.data.get(ATTR_HOMEASSISTANT)
 
@@ -550,7 +549,7 @@ class AddonModel(JobGroup, ABC):
         return self.data.get(ATTR_MACHINE, [])
 
     @property
-    def arch(self) -> str:
+    def arch(self) -> CpuArch:
         """Return architecture to use for the addon's image."""
         if ATTR_IMAGE in self.data:
             return self.sys_arch.match(self.data[ATTR_ARCH])
@@ -581,7 +580,7 @@ class AddonModel(JobGroup, ABC):
     @property
     def path_location(self) -> Path:
         """Return path to this add-on."""
-        return Path(self.data[ATTR_LOCATON])
+        return Path(self.data[ATTR_LOCATION])
 
     @property
     def path_icon(self) -> Path:
@@ -618,7 +617,7 @@ class AddonModel(JobGroup, ABC):
         return AddonOptions(self.coresys, raw_schema, self.name, self.slug)
 
     @property
-    def schema_ui(self) -> list[dict[any, any]] | None:
+    def schema_ui(self) -> list[dict[Any, Any]] | None:
         """Create a UI schema for add-on options."""
         raw_schema = self.data[ATTR_SCHEMA]
 
@@ -633,18 +632,28 @@ class AddonModel(JobGroup, ABC):
 
     @property
     def signed(self) -> bool:
-        """Return True if the image is signed."""
-        return ATTR_CODENOTARY in self.data
-
-    @property
-    def codenotary(self) -> str | None:
-        """Return Signer email address for CAS."""
-        return self.data.get(ATTR_CODENOTARY)
+        """Currently no signing support."""
+        return False
 
     @property
     def breaking_versions(self) -> list[AwesomeVersion]:
         """Return breaking versions of addon."""
         return self.data[ATTR_BREAKING_VERSIONS]
+
+    async def long_description(self) -> str | None:
+        """Return README.md as long_description."""
+
+        def read_readme() -> str | None:
+            readme = Path(self.path_location, "README.md")
+
+            # If readme not exists
+            if not readme.exists():
+                return None
+
+            # Return data
+            return readme.read_text(encoding="utf-8", errors="replace")
+
+        return await self.sys_run_in_executor(read_readme)
 
     def refresh_path_cache(self) -> Awaitable[None]:
         """Refresh cache of existing paths."""
@@ -661,11 +670,15 @@ class AddonModel(JobGroup, ABC):
         """Validate if addon is available for current system."""
         return self._validate_availability(self.data, logger=_LOGGER.error)
 
-    def __eq__(self, other):
-        """Compaired add-on objects."""
+    def __eq__(self, other: Any) -> bool:
+        """Compare add-on objects."""
         if not isinstance(other, AddonModel):
             return False
         return self.slug == other.slug
+
+    def __hash__(self) -> int:
+        """Hash for add-on objects."""
+        return hash(self.slug)
 
     def _validate_availability(
         self, config, *, logger: Callable[..., None] | None = None
@@ -673,9 +686,8 @@ class AddonModel(JobGroup, ABC):
         """Validate if addon is available for current system."""
         # Architecture
         if not self.sys_arch.is_supported(config[ATTR_ARCH]):
-            raise AddonsNotSupportedError(
-                f"Add-on {self.slug} not supported on this platform, supported architectures: {', '.join(config[ATTR_ARCH])}",
-                logger,
+            raise AddonNotSupportedArchitectureError(
+                logger, slug=self.slug, architectures=config[ATTR_ARCH]
             )
 
         # Machine / Hardware
@@ -683,9 +695,8 @@ class AddonModel(JobGroup, ABC):
         if machine and (
             f"!{self.sys_machine}" in machine or self.sys_machine not in machine
         ):
-            raise AddonsNotSupportedError(
-                f"Add-on {self.slug} not supported on this machine, supported machine types: {', '.join(machine)}",
-                logger,
+            raise AddonNotSupportedMachineTypeError(
+                logger, slug=self.slug, machine_types=machine
             )
 
         # Home Assistant
@@ -694,16 +705,15 @@ class AddonModel(JobGroup, ABC):
             if version and not version_is_new_enough(
                 self.sys_homeassistant.version, version
             ):
-                raise AddonsNotSupportedError(
-                    f"Add-on {self.slug} not supported on this system, requires Home Assistant version {version} or greater",
-                    logger,
+                raise AddonNotSupportedHomeAssistantVersionError(
+                    logger, slug=self.slug, version=str(version)
                 )
 
     def _available(self, config) -> bool:
         """Return True if this add-on is available on this platform."""
         try:
             self._validate_availability(config)
-        except AddonsNotSupportedError:
+        except AddonNotSupportedError:
             return False
 
         return True

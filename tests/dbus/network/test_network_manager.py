@@ -6,7 +6,7 @@ from unittest.mock import Mock, PropertyMock, patch
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
 
-from supervisor.dbus.const import ConnectionStateType
+from supervisor.dbus.const import ConnectionState
 from supervisor.dbus.network import NetworkManager
 from supervisor.dbus.network.interface import NetworkInterface
 from supervisor.exceptions import (
@@ -93,7 +93,7 @@ async def test_activate_connection(
         "/org/freedesktop/NetworkManager/Settings/1",
         "/org/freedesktop/NetworkManager/Devices/1",
     )
-    assert connection.state == ConnectionStateType.ACTIVATED
+    assert connection.state == ConnectionState.ACTIVATED
     assert (
         connection.settings.object_path == "/org/freedesktop/NetworkManager/Settings/1"
     )
@@ -117,7 +117,7 @@ async def test_add_and_activate_connection(
     )
     assert settings.connection.uuid == "0c23631e-2118-355c-bbb0-8943229cb0d6"
     assert settings.ipv4.method == "auto"
-    assert connection.state == ConnectionStateType.ACTIVATED
+    assert connection.state == ConnectionState.ACTIVATED
     assert (
         connection.settings.object_path == "/org/freedesktop/NetworkManager/Settings/1"
     )
@@ -196,6 +196,7 @@ async def test_ignore_veth_only_changes(
     assert network_manager.properties["Devices"] == [
         "/org/freedesktop/NetworkManager/Devices/1",
         "/org/freedesktop/NetworkManager/Devices/3",
+        "/org/freedesktop/NetworkManager/Devices/38",
     ]
     with patch.object(NetworkInterface, "connect") as connect:
         network_manager_service.emit_properties_changed(
@@ -204,6 +205,7 @@ async def test_ignore_veth_only_changes(
                     "/org/freedesktop/NetworkManager/Devices/1",
                     "/org/freedesktop/NetworkManager/Devices/3",
                     "/org/freedesktop/NetworkManager/Devices/35",
+                    "/org/freedesktop/NetworkManager/Devices/38",
                 ]
             }
         )
@@ -249,3 +251,25 @@ async def test_network_manager_stopped(
     capture_exception.assert_called_once()
     assert isinstance(capture_exception.call_args.args[0], DBusServiceUnkownError)
     assert "NetworkManager not responding" in caplog.text
+
+
+async def test_primary_connection_update(
+    network_manager_service: NetworkManagerService,
+    network_manager: NetworkManager,
+):
+    """Test handling of primary connection change."""
+    interface = next(
+        (
+            intr
+            for intr in network_manager.interfaces
+            if intr.object_path == "/org/freedesktop/NetworkManager/Devices/1"
+        ),
+        None,
+    )
+    await network_manager.update({"PrimaryConnection": "/"})
+    assert interface.primary is False
+
+    await network_manager.update(
+        {"PrimaryConnection": "/org/freedesktop/NetworkManager/ActiveConnection/1"}
+    )
+    assert interface.primary is True

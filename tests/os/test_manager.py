@@ -1,6 +1,6 @@
 """Test Home Assistant OS functionality."""
 
-from unittest.mock import PropertyMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from awesomeversion import AwesomeVersion
 from dbus_fast import Variant
@@ -9,15 +9,19 @@ import pytest
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
 from supervisor.exceptions import HassOSJobError
+from supervisor.resolution.const import UnhealthyReason
 
+from tests.common import MockResponse
 from tests.dbus_service_mocks.base import DBusServiceMock
 from tests.dbus_service_mocks.rauc import Rauc as RaucService
 
 # pylint: disable=protected-access
 
 
-@pytest.mark.asyncio
-async def test_ota_url_generic_x86_64_rename(coresys: CoreSys) -> None:
+@pytest.mark.usefixtures("no_job_throttle")
+async def test_ota_url_generic_x86_64_rename(
+    coresys: CoreSys, mock_update_data: MockResponse, supervisor_internet: AsyncMock
+) -> None:
     """Test download URL generated."""
     coresys.os._board = "intel-nuc"
     coresys.os._version = AwesomeVersion("5.13")
@@ -65,13 +69,30 @@ def test_ota_url_os_name_rel_5_downgrade(coresys: CoreSys) -> None:
     assert url == url_formatted
 
 
-async def test_update_fails_if_out_of_date(coresys: CoreSys) -> None:
+async def test_update_fails_if_out_of_date(
+    coresys: CoreSys, supervisor_internet: AsyncMock
+) -> None:
     """Test update of OS fails if Supervisor is out of date."""
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
     with (
         patch.object(
             type(coresys.supervisor), "need_update", new=PropertyMock(return_value=True)
         ),
+        patch.object(
+            type(coresys.os), "available", new=PropertyMock(return_value=True)
+        ),
+        pytest.raises(HassOSJobError),
+    ):
+        await coresys.os.update()
+
+
+async def test_update_fails_if_unhealthy(
+    coresys: CoreSys,
+) -> None:
+    """Test update of OS fails if Supervisor is unhealthy."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.resolution.add_unhealthy_reason(UnhealthyReason.DUPLICATE_OS_INSTALLATION)
+    with (
         patch.object(
             type(coresys.os), "available", new=PropertyMock(return_value=True)
         ),

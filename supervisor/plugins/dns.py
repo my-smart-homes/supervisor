@@ -15,7 +15,8 @@ from awesomeversion import AwesomeVersion
 import jinja2
 import voluptuous as vol
 
-from ..const import ATTR_SERVERS, DNS_SUFFIX, LogLevel
+from ..bus import EventListener
+from ..const import ATTR_SERVERS, DNS_SUFFIX, BusEvent, LogLevel
 from ..coresys import CoreSys
 from ..dbus.const import MulticastProtocolEnabled
 from ..docker.const import ContainerState
@@ -28,12 +29,13 @@ from ..exceptions import (
     CoreDNSJobError,
     CoreDNSUpdateError,
     DockerError,
+    PluginError,
 )
-from ..jobs.const import JobExecutionLimit
+from ..jobs.const import JobThrottle
 from ..jobs.decorator import Job
 from ..resolution.const import ContextType, IssueType, SuggestionType, UnhealthyReason
 from ..utils.json import write_json_file
-from ..utils.sentry import capture_exception
+from ..utils.sentry import async_capture_exception
 from ..validate import dns_url
 from .base import PluginBase
 from .const import (
@@ -71,11 +73,17 @@ class PluginDns(PluginBase):
         self.slug = "dns"
         self.coresys: CoreSys = coresys
         self.instance: DockerDNS = DockerDNS(coresys)
-        self.resolv_template: jinja2.Template | None = None
-        self.hosts_template: jinja2.Template | None = None
+        self._resolv_template: jinja2.Template | None = None
+        self._hosts_template: jinja2.Template | None = None
 
         self._hosts: list[HostEntry] = []
         self._loop: bool = False
+        self._cached_locals: list[str] | None = None
+
+        # Debouncing system for rapid local changes
+        self._locals_changed_handle: asyncio.TimerHandle | None = None
+        self._restart_after_locals_change_handle: asyncio.Task | None = None
+        self._connectivity_check_listener: EventListener | None = None
 
     @property
     def hosts(self) -> Path:
@@ -90,6 +98,15 @@ class PluginDns(PluginBase):
     @property
     def locals(self) -> list[str]:
         """Return list of local system DNS servers."""
+        if self._cached_locals is None:
+            self._cached_locals = self._compute_locals()
+        return self._cached_locals
+
+    def _compute_locals(self) -> list[str]:
+        """Compute list of local system DNS servers.
+
+        Returns servers in stable priority order from NetworkManager.
+        """
         servers: list[str] = []
         for server in [
             f"dns://{server!s}" for server in self.sys_host.network.dns_servers
@@ -98,6 +115,52 @@ class PluginDns(PluginBase):
                 servers.append(dns_url(server))
 
         return servers
+
+    async def _on_dns_container_running(self, event: DockerContainerStateEvent) -> None:
+        """Handle DNS container state change to running and trigger connectivity check."""
+        if event.name == self.instance.name and event.state == ContainerState.RUNNING:
+            # Wait before CoreDNS actually becomes available
+            await asyncio.sleep(5)
+
+            _LOGGER.debug("CoreDNS started, checking connectivity")
+            await self.sys_supervisor.check_connectivity()
+
+    async def _restart_dns_after_locals_change(self) -> None:
+        """Restart DNS after a debounced delay for local changes."""
+        old_locals = self._cached_locals
+        new_locals = self._compute_locals()
+        if old_locals == new_locals:
+            return
+
+        _LOGGER.debug("DNS locals changed from %s to %s", old_locals, new_locals)
+        self._cached_locals = new_locals
+        if not await self.instance.is_running():
+            return
+
+        await self.restart()
+        self._restart_after_locals_change_handle = None
+
+    def _trigger_restart_dns_after_locals_change(self) -> None:
+        """Trigger a restart of DNS after local changes."""
+        # Cancel existing restart task if any
+        if self._restart_after_locals_change_handle:
+            self._restart_after_locals_change_handle.cancel()
+
+        self._restart_after_locals_change_handle = self.sys_create_task(
+            self._restart_dns_after_locals_change()
+        )
+        self._locals_changed_handle = None
+
+    def notify_locals_changed(self) -> None:
+        """Schedule a debounced DNS restart for local changes."""
+        # Cancel existing timer if any
+        if self._locals_changed_handle:
+            self._locals_changed_handle.cancel()
+
+        # Schedule new timer with 1 second delay
+        self._locals_changed_handle = self.sys_call_later(
+            1.0, self._trigger_restart_dns_after_locals_change
+        )
 
     @property
     def servers(self) -> list[str]:
@@ -147,32 +210,66 @@ class PluginDns(PluginBase):
         """Set fallback DNS enabled."""
         self._data[ATTR_FALLBACK] = value
 
+    @property
+    def hosts_template(self) -> jinja2.Template:
+        """Get hosts jinja template."""
+        if not self._hosts_template:
+            raise RuntimeError("Hosts template not set!")
+        return self._hosts_template
+
+    @property
+    def resolv_template(self) -> jinja2.Template:
+        """Get resolv jinja template."""
+        if not self._resolv_template:
+            raise RuntimeError("Resolv template not set!")
+        return self._resolv_template
+
     async def load(self) -> None:
         """Load DNS setup."""
         # Initialize CoreDNS Template
         try:
-            self.resolv_template = jinja2.Template(
-                RESOLV_TMPL.read_text(encoding="utf-8")
+            self._resolv_template = jinja2.Template(
+                await self.sys_run_in_executor(RESOLV_TMPL.read_text, encoding="utf-8")
             )
         except OSError as err:
             if err.errno == errno.EBADMSG:
-                self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
+                )
             _LOGGER.error("Can't read resolve.tmpl: %s", err)
+
         try:
-            self.hosts_template = jinja2.Template(
-                HOSTS_TMPL.read_text(encoding="utf-8")
+            self._hosts_template = jinja2.Template(
+                await self.sys_run_in_executor(HOSTS_TMPL.read_text, encoding="utf-8")
             )
         except OSError as err:
             if err.errno == errno.EBADMSG:
-                self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
+                )
             _LOGGER.error("Can't read hosts.tmpl: %s", err)
 
         await self._init_hosts()
+
+        # Register Docker event listener for connectivity checks
+        if not self._connectivity_check_listener:
+            self._connectivity_check_listener = self.sys_bus.register_event(
+                BusEvent.DOCKER_CONTAINER_STATE_CHANGE, self._on_dns_container_running
+            )
+
         await super().load()
 
         # Update supervisor
-        self._write_resolv(HOST_RESOLV)
-        await self.sys_supervisor.check_connectivity()
+        # Resolv template should always be set but just in case don't fail load
+        if self._resolv_template:
+            await self._write_resolv(HOST_RESOLV)
+
+        # Reinitializing aiohttp.ClientSession after DNS setup makes sure that
+        # aiodns is using the right DNS servers (see #5857).
+        # At this point it should be fairly safe to replace the session since
+        # we only use the session synchronously during setup and not thorugh the
+        # API which previously caused issues (see #5851).
+        await self.coresys.init_websession()
 
     async def install(self) -> None:
         """Install CoreDNS."""
@@ -190,21 +287,21 @@ class PluginDns(PluginBase):
         """Update CoreDNS plugin."""
         try:
             await super().update(version)
-        except DockerError as err:
+        except (DockerError, PluginError) as err:
             raise CoreDNSUpdateError("CoreDNS update failed", _LOGGER.error) from err
 
     async def restart(self) -> None:
         """Restart CoreDNS plugin."""
-        self._write_config()
+        await self._write_config()
         _LOGGER.info("Restarting CoreDNS plugin")
         try:
             await self.instance.restart()
         except DockerError as err:
-            raise CoreDNSError("Can't start CoreDNS plugin", _LOGGER.error) from err
+            raise CoreDNSError("Can't restart CoreDNS plugin", _LOGGER.error) from err
 
     async def start(self) -> None:
         """Run CoreDNS."""
-        self._write_config()
+        await self._write_config()
 
         # Start Instance
         _LOGGER.info("Starting CoreDNS plugin")
@@ -215,6 +312,16 @@ class PluginDns(PluginBase):
 
     async def stop(self) -> None:
         """Stop CoreDNS."""
+        # Cancel any pending locals change timer
+        if self._locals_changed_handle:
+            self._locals_changed_handle.cancel()
+            self._locals_changed_handle = None
+
+        # Wait for any pending restart before stopping
+        if self._restart_after_locals_change_handle:
+            self._restart_after_locals_change_handle.cancel()
+            self._restart_after_locals_change_handle = None
+
         _LOGGER.info("Stopping CoreDNS plugin")
         try:
             await self.instance.stop()
@@ -226,7 +333,7 @@ class PluginDns(PluginBase):
         # Reset manually defined DNS
         self.servers.clear()
         self.fallback = True
-        self.save_data()
+        await self.save_data()
 
         # Resets hosts
         with suppress(OSError):
@@ -247,10 +354,10 @@ class PluginDns(PluginBase):
 
     @Job(
         name="plugin_dns_restart_after_problem",
-        limit=JobExecutionLimit.THROTTLE_RATE_LIMIT,
         throttle_period=WATCHDOG_THROTTLE_PERIOD,
         throttle_max_calls=WATCHDOG_THROTTLE_MAX_CALLS,
         on_condition=CoreDNSJobError,
+        throttle=JobThrottle.RATE_LIMIT,
     )
     async def _restart_after_problem(self, state: ContainerState):
         """Restart unhealthy or failed plugin."""
@@ -273,7 +380,7 @@ class PluginDns(PluginBase):
         else:
             self._loop = False
 
-    def _write_config(self) -> None:
+    async def _write_config(self) -> None:
         """Write CoreDNS config."""
         debug: bool = self.sys_config.logging == LogLevel.DEBUG
         dns_servers: list[str] = []
@@ -297,7 +404,8 @@ class PluginDns(PluginBase):
 
         # Write config to plugin
         try:
-            write_json_file(
+            await self.sys_run_in_executor(
+                write_json_file,
                 self.coredns_config,
                 {
                     "servers": dns_servers,
@@ -341,7 +449,9 @@ class PluginDns(PluginBase):
             )
         except OSError as err:
             if err.errno == errno.EBADMSG:
-                self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
+                )
             raise CoreDNSError(f"Can't update hosts: {err}", _LOGGER.error) from err
 
     async def add_host(
@@ -410,16 +520,10 @@ class PluginDns(PluginBase):
             await self.instance.install(self.version)
         except DockerError as err:
             _LOGGER.error("Repair of CoreDNS failed")
-            capture_exception(err)
+            await async_capture_exception(err)
 
-    def _write_resolv(self, resolv_conf: Path) -> None:
+    async def _write_resolv(self, resolv_conf: Path) -> None:
         """Update/Write resolv.conf file."""
-        if not self.resolv_template:
-            _LOGGER.warning(
-                "Resolv template is missing, cannot write/update %s", resolv_conf
-            )
-            return
-
         nameservers = [str(self.sys_docker.network.dns), "127.0.0.11"]
 
         # Read resolv config
@@ -427,10 +531,12 @@ class PluginDns(PluginBase):
 
         # Write config back to resolv
         try:
-            resolv_conf.write_text(data)
+            await self.sys_run_in_executor(resolv_conf.write_text, data)
         except OSError as err:
             if err.errno == errno.EBADMSG:
-                self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
+                )
             _LOGGER.warning("Can't write/update %s: %s", resolv_conf, err)
             return
 

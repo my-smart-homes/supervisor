@@ -1,5 +1,6 @@
 """NetworkInterface object for Network Manager."""
 
+import logging
 from typing import Any
 
 from dbus_fast.aio.message_bus import MessageBus
@@ -23,11 +24,13 @@ from .connection import NetworkConnection
 from .setting import NetworkSetting
 from .wireless import NetworkWireless
 
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
 
 class NetworkInterface(DBusInterfaceProxy):
     """NetworkInterface object represents Network Manager Device objects.
 
-    https://developer.gnome.org/NetworkManager/stable/gdbus-org.freedesktop.NetworkManager.Device.html
+    https://networkmanager.dev/docs/api/latest/gdbus-org.freedesktop.NetworkManager.Device.html
     """
 
     bus_name: str = DBUS_NAME_NM
@@ -36,18 +39,20 @@ class NetworkInterface(DBusInterfaceProxy):
 
     def __init__(self, object_path: str) -> None:
         """Initialize NetworkConnection object."""
-        super().__init__()
-
-        self.object_path: str = object_path
-
+        self._object_path: str = object_path
         self.primary: bool = False
-
         self._connection: NetworkConnection | None = None
         self._wireless: NetworkWireless | None = None
+        super().__init__()
+
+    @property
+    def object_path(self) -> str:
+        """Object path for dbus object."""
+        return self._object_path
 
     @property
     @dbus_property
-    def name(self) -> str:
+    def interface_name(self) -> str:
         """Return interface name."""
         return self.properties[DBUS_ATTR_DEVICE_INTERFACE]
 
@@ -55,7 +60,15 @@ class NetworkInterface(DBusInterfaceProxy):
     @dbus_property
     def type(self) -> DeviceType:
         """Return interface type."""
-        return self.properties[DBUS_ATTR_DEVICE_TYPE]
+        try:
+            return DeviceType(self.properties[DBUS_ATTR_DEVICE_TYPE])
+        except ValueError:
+            _LOGGER.debug(
+                "Unknown device type %s for %s, treating as UNKNOWN",
+                self.properties[DBUS_ATTR_DEVICE_TYPE],
+                self.object_path,
+            )
+            return DeviceType.UNKNOWN
 
     @property
     @dbus_property
@@ -130,7 +143,9 @@ class NetworkInterface(DBusInterfaceProxy):
 
         self.sync_properties = self.managed
         if self.sync_properties and self.is_connected:
-            self.dbus.sync_property_changes(self.properties_interface, self.update)
+            self.connected_dbus.sync_property_changes(
+                self.properties_interface, self.update
+            )
 
     @dbus_connected
     async def update(self, changed: dict[str, Any] | None = None) -> None:
@@ -157,7 +172,7 @@ class NetworkInterface(DBusInterfaceProxy):
                 self.connection = NetworkConnection(
                     self.properties[DBUS_ATTR_ACTIVE_CONNECTION]
                 )
-                await self.connection.connect(self.dbus.bus)
+                await self.connection.connect(self.connected_dbus.bus)
             else:
                 self.connection = None
 
@@ -169,7 +184,7 @@ class NetworkInterface(DBusInterfaceProxy):
                 await self.wireless.update()
             else:
                 self.wireless = NetworkWireless(self.object_path)
-                await self.wireless.connect(self.dbus.bus)
+                await self.wireless.connect(self.connected_dbus.bus)
 
     def shutdown(self) -> None:
         """Shutdown the object and disconnect from D-Bus.

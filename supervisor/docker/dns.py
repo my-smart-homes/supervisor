@@ -2,13 +2,11 @@
 
 import logging
 
-from docker.types import Mount
-
 from ..coresys import CoreSysAttributes
 from ..exceptions import DockerJobError
-from ..jobs.const import JobExecutionLimit
+from ..jobs.const import JobConcurrency
 from ..jobs.decorator import Job
-from .const import ENV_TIME, MOUNT_DBUS, MountType
+from .const import ENV_TIME, MOUNT_DBUS, DockerMount, MountType
 from .interface import DockerInterface
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -31,8 +29,8 @@ class DockerDNS(DockerInterface, CoreSysAttributes):
 
     @Job(
         name="docker_dns_run",
-        limit=JobExecutionLimit.GROUP_ONCE,
         on_condition=DockerJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def run(self) -> None:
         """Run Docker image."""
@@ -47,7 +45,7 @@ class DockerDNS(DockerInterface, CoreSysAttributes):
             security_opt=self.security_opt,
             environment={ENV_TIME: self.sys_timezone},
             mounts=[
-                Mount(
+                DockerMount(
                     type=MountType.BIND,
                     source=self.sys_config.path_extern_dns.as_posix(),
                     target="/config",
