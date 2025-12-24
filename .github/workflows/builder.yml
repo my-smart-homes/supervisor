@@ -255,7 +255,7 @@ jobs:
       # home-assistant/builder doesn't support sha pinning
       - name: Build the Supervisor
         if: needs.init.outputs.publish != 'true'
-        uses: my-smart-homes/builder@master
+        uses: home-assistant/builder@master
         with:
           args: |
             --test \
