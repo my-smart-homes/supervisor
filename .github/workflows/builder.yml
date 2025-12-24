@@ -203,9 +203,8 @@ jobs:
 
       # home-assistant/builder doesn't support sha pinning
       - name: Build supervisor
-        uses: my-smart-homes/builder@master
+        uses: home-assistant/builder@master
         with:
-          image: ${{ matrix.arch }}
           args: |
             $BUILD_ARGS \
             --${{ matrix.arch }} \
