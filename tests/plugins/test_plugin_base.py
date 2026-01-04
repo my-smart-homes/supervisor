@@ -351,8 +351,8 @@ async def test_load_with_incorrect_image(
     coresys: CoreSys, container: MagicMock, plugin: PluginBase
 ):
     """Test plugin loads with the incorrect image."""
-    plugin.image = old_image = f"ghcr.io/home-assistant/aarch64-hassio-{plugin.slug}"
-    correct_image = f"ghcr.io/home-assistant/amd64-hassio-{plugin.slug}"
+    plugin.image = old_image = f"ghcr.io/my-smart-homes/aarch64-hassio-{plugin.slug}"
+    correct_image = f"ghcr.io/my-smart-homes/amd64-hassio-{plugin.slug}"
     coresys.updater._data["image"][plugin.slug] = correct_image  # pylint: disable=protected-access
     plugin.version = AwesomeVersion("2024.4.0")
 
@@ -391,4 +391,4 @@ async def test_default_image_fallback(
 ):
     """Test default image falls back to hard-coded constant if we fail to fetch version file."""
     assert getattr(coresys.updater, f"image_{plugin.slug}") is None
-    assert plugin.default_image == f"ghcr.io/home-assistant/amd64-hassio-{plugin.slug}"
+    assert plugin.default_image == f"ghcr.io/my-smart-homes/amd64-hassio-{plugin.slug}"
