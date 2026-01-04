@@ -496,7 +496,8 @@ async def test_core_loads_wrong_image_for_machine(
         force=True,
     )
     assert (
-        coresys.homeassistant.image == "ghcr.io/my-smart-homes/qemux86-64-my-smart-homes"
+        coresys.homeassistant.image
+        == "ghcr.io/my-smart-homes/qemux86-64-my-smart-homes"
     )
 
 
@@ -555,5 +556,6 @@ async def test_core_loads_wrong_image_for_architecture(
         force=True,
     )
     assert (
-        coresys.homeassistant.image == "ghcr.io/my-smart-homes/qemux86-64-my-smart-homes"
+        coresys.homeassistant.image
+        == "ghcr.io/my-smart-homes/qemux86-64-my-smart-homes"
     )

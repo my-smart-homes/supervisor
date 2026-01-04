@@ -75,7 +75,8 @@ async def test_api_set_options(api_client: TestClient, coresys: CoreSys):
 async def test_api_set_image(api_client: TestClient, coresys: CoreSys):
     """Test changing the image for homeassistant."""
     assert (
-        coresys.homeassistant.image == "ghcr.io/my-smart-homes/qemux86-64-my-smart-homes"
+        coresys.homeassistant.image
+        == "ghcr.io/my-smart-homes/qemux86-64-my-smart-homes"
     )
     assert coresys.homeassistant.override_image is False
 
@@ -97,7 +98,8 @@ async def test_api_set_image(api_client: TestClient, coresys: CoreSys):
 
     assert resp.status == 200
     assert (
-        coresys.homeassistant.image == "ghcr.io/my-smart-homes/qemux86-64-my-smart-homes"
+        coresys.homeassistant.image
+        == "ghcr.io/my-smart-homes/qemux86-64-my-smart-homes"
     )
     assert coresys.homeassistant.override_image is False
 
