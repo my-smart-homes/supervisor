@@ -201,15 +201,16 @@ jobs:
         if: needs.init.outputs.publish == 'false'
         run: echo "BUILD_ARGS=--test" >> $GITHUB_ENV
 
-      # home-assistant/builder doesn't support sha pinning
+      # Use custom builder with cosign verification disabled
       - name: Build supervisor
-        uses: home-assistant/builder@master
+        uses: my-smart-homes/builder@master
         with:
           image: ${{ matrix.arch }}
           args: |
             $BUILD_ARGS \
             --${{ matrix.arch }} \
             --target /data \
+            --no-cosign-verify \
             --generic ${{ needs.init.outputs.version }}
 
   version:
@@ -253,15 +254,16 @@ jobs:
           name: wheels-amd64
           path: wheels
 
-      # home-assistant/builder doesn't support sha pinning
+      # Use custom builder with cosign verification disabled
       - name: Build the Supervisor
         if: needs.init.outputs.publish != 'true'
-        uses: home-assistant/builder@master
+        uses: my-smart-homes/builder@master
         with:
           args: |
             --test \
             --amd64 \
             --target /data \
+            --no-cosign-verify \
             --generic runner
 
       - name: Pull Supervisor
